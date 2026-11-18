@@ -14,10 +14,11 @@ the result. The tables are far too big for git, so they are published separately
 
 | Path | What it is |
 | --- | --- |
-| `btc-indexer/` | The indexer, a single Rust binary: full-chain scan, per-block updates, the daily merge into the tables, and an HTTP lookup API. |
+| `btc-indexer/` | The indexer, a single Rust binary: export of a best-chain list from a node, full-chain scan of the listed blocks, per-block updates, the daily merge into the tables, and an HTTP lookup API. |
 | `btc-indexer/test_vectors_070.json` | 128 vectors for `--self-test`: 97 level vectors and 31 extraction vectors. |
+| `btc-indexer/tests/old-vs-new/` | Compares this scanner with the scanner of the first commit of this repository (tag `original-scanner`). `build-old-stage1.sh` builds that scanner with a stop after its first phase, `fixture-diff.sh` runs both on a generated fixture chain, `regtest.sh` on a regtest chain (Bitcoin Core 28.1), and `state-oracle.py` checks the new state files against the old scanner's first-phase shards. The old source is the `btc-indexer/` directory of that commit, for example from `git worktree add ../original-scanner original-scanner`; the fixture comes from `BTC_INDEXER_FIXTURE_DIR=<dir> cargo test --release -- --ignored --exact integrity_tests::chain_scan::write_scan_fixture`. |
 | `docs/extraction-rules.md` | What counts as a published key or a revealed script, what each table and counter means, and how to rebuild the snapshot. Start here. |
-| `results/975019/` | The `stats.json` files of the scan and of the UTXO census at block 975,019, the checksum comparison of the 2026-11-08 rebuild, and three cross-checks: the output of an audit extension of the census tool, a histogram of the witness programs in the same UTXO set, and a sample of unexposed outputs checked against a public Esplora API. `results/975019/README.md` says what wrote each file. |
+| `results/975019/` | The `stats.json` files of the scan and of the UTXO census at block 975,019, the checksum comparison of the 2026-11-08 rebuild, and three cross-checks: the output of an audit extension of the census tool, a histogram of the witness programs in the same UTXO set, and a sample of unexposed outputs checked against a public Esplora API. The chain-list scan adds its `stats.json` and `checkpoint.json`, its checksum check and the SHA256 of its chain list. `results/975019/README.md` says what wrote each file. |
 | `tools/utxo-census/` | Joins a Bitcoin Core UTXO snapshot (`dumptxoutset`) with the tables and counts the unspent outputs whose key or script is already public. Rust standard library only. |
 | `tools/validation/` | Read-only Python checks. `table-check.py` and `validate-index.py` check the tables: their integrity, and spot checks against chain data from a public Esplora API. `witness-histogram.py` reads a UTXO snapshot instead (next row). |
 | `tools/validation/witness-histogram.py` | A check of a UTXO snapshot that you export yourself with `dumptxoutset` at block 975,019: witness programs by version and length, and class totals to compare with the census. It shares no code with `tools/utxo-census`; `results/975019/README.md` says how it relates to `witness-program-histogram.json`. |
@@ -59,31 +60,46 @@ present too.
 The 975019 tables were first built by an earlier version of this scanner, without the census counters; its
 exact revision was not recorded. A second build on 2026-11-08, run with no shard files to resume from and with
 the census counters added, gave the same five tables and `last_indexed_height` byte for byte
-(`results/975019/verify-against-original.log`); its `stats.json` differs only by the `census` object. On the
-scan path, `btc-indexer/src/main.rs` here differs from the revision that ran that build only at lines 471-473,
-486, 495 and 508, where three preallocations are capped at the remaining input, and at line 2262, a printed
-heading; neither changes what is parsed or written (details in `results/975019/README.md`). The code in this
-repository has not itself been run over the chain end to end.
+(`results/975019/verify-against-original.log`); its `stats.json` differs only by the `census` object. That
+build ran an internal revision whose scan path differs from that of the first commit of this repository (tag
+`original-scanner`) only as `results/975019/README.md` lists. The scanner in this version takes a best-chain
+list exported from a node and checks every listed block before it reads anything from it (section 2.1 of
+`docs/extraction-rules.md`). It was run over the chain end to end on 2026-11-16 and reproduced the six files
+byte for byte; its `stats.json` without `census`, `scan_height` and `scan_block_hash` has the hash of the
+archive's `stats.json` (details in `results/975019/README.md`).
 
 What you need:
 
-- **A full node.** Bitcoin Core on mainnet, not pruned, with a blocks directory created with `-blocksxor=0`.
-  Recent versions obfuscate block files by default, and the scanner can't read them. At this height the
-  block data was about 730 GB.
+- **A full node.** Bitcoin Core on mainnet, not pruned, with a blocks directory created with `-blocksxor=0`,
+  out of initial block download, with as many headers as blocks, at least 100 blocks past 975,019, and with
+  RPC access through its cookie file. Recent versions obfuscate block files by default, and the scanner can't
+  read them. At this height the block data was about 730 GB.
 - **Scratch disk.** Code comments put the temporary shards at about 56 GB for 20-byte hashes, 33 GB for 32-byte
   hashes and 20 GB for candidates; the x-value shards come on top and weren't measured. The finished tables
-  take 34,578,118,864 bytes.
+  take 34,578,118,864 bytes and the state files 146,234,643,004 bytes.
 - **Memory.** The last phases hold three bytes per distinct x-coordinate, about 5.3 GB here, plus one shard of
-  hashes. An earlier phase holds a 2 GiB Bloom filter next to one byte per x.
-- **Time.** About 3.3 hours on the reference machine (8 vCPU, 32 GB), close to two of them spent reading block
-  files at roughly 106 MB/s.
+  hashes. An earlier phase holds a 2 GiB Bloom filter next to one byte per x. In the chain-list scan, the
+  scanner's `VmHWM` (peak resident memory so far), read every ten minutes, was 7,102,240 KiB (about 7.3 GB) at
+  the last reading, 7 minutes 48 seconds before the scan ended; a later peak was not recorded.
+- **Time.** The chain-list scan took 13,932.7 seconds, about 3 hours 52 minutes, 6,956.3 of them in the block
+  scan, on an n2d-standard-8 machine (8 vCPUs, 32 GiB of memory) with its container limited to 6 CPUs and
+  12 GiB.
 
 Steps:
 
-1. Get block files that hold exactly the best chain from block 0 to 975,019. The scanner reads every block
-   record in every `blk*.dat` file and doesn't check chain membership, so a stale block or anything above
-   975,019 changes the result. A node stopped at that height may already have later blocks on disk. If in
-   doubt, export the blocks over RPC into fresh files; section 9 of `docs/extraction-rules.md` has the format.
+1. Use a mainnet node that keeps all blocks and whose blocks directory was created with `-blocksxor=0` (the
+   scanner stops if `xor.dat` holds a non-zero byte). The export below stops with an error unless the node is
+   out of initial block download, has as many headers as blocks and is at least 100 blocks past 975,019, both
+   when the export starts and when it ends, and unless the hash at 975,019 is still the same at the end. With
+   the scanner built (step 2), export the best-chain list through the node's RPC cookie:
+
+   ```
+   ./target/release/btc-indexer --export-chain-list http://127.0.0.1:8332/ <datadir>/.cookie 975019 chain-975019.txt
+   ```
+
+   The URL must have the form `http://<host>:<port>/`, and the output file must not exist yet. The last line
+   must read `975019 0000000000000000000158c9898f947463d71d98c97f1dad1639e25114a1dae6`. Stale blocks and
+   blocks above 975,019 in the block files do no harm: the scan skips them.
 
 2. Build and test:
 
@@ -105,15 +121,20 @@ Steps:
    against that earlier text. Section 11.5 of `docs/extraction-rules.md` lists where their expected results differ
    from the draft text as it stands now.
 
-3. Scan, then write the height file (this scanner doesn't):
+3. Scan into a directory that is absent or empty (there is no resume):
 
    ```
-   ./target/release/btc-indexer --scan-blocks <blocks_dir> <out_dir>
-   printf '975019\n' > <out_dir>/last_indexed_height
+   ./target/release/btc-indexer --scan-blocks <blocks_dir> <out_dir> chain-975019.txt
    ```
 
-   Use an empty directory: the scanner resumes from shard files under `<out_dir>/shards` if it finds any.
-   Phase 1 has to end with `975020 blocks, 1476123483 txs`. Any other count means the block files are wrong.
+   Records that are not on the list are skipped and counted. Every listed block is checked before anything is
+   taken from it, among other things for its header hash, the link to the previous block, the Merkle root and
+   the witness commitment (section 2.1 of `docs/extraction-rules.md`). Phase 1 has to end with
+   `975020 blocks, 1476123483 txs`. The scanner writes `last_indexed_height` itself, plus `state/` and
+   `checkpoint.json`. The scanner signals success with exit status 0. `checkpoint.json` is written last and
+   lists the SHA-256 of every output file; check the files against it before use (section 5.4 of the rules).
+   Its `stats.json` has two extra keys, `scan_height` and `scan_block_hash`; drop them along with `census`
+   before the check in step 4.
 
 4. Check. Save the six checksum lines of section 5.5 of `docs/extraction-rules.md` as `SHA256SUMS-975019` in
    `<out_dir>`, then:
@@ -121,13 +142,15 @@ Steps:
    ```
    cd <out_dir>
    sha256sum -c SHA256SUMS-975019
-   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("census"); sys.stdout.buffer.write(json.dumps(d, indent=2, sort_keys=True).encode())' stats.json | sha256sum
+   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [d.pop(k, None) for k in ("census", "scan_height", "scan_block_hash")]; sys.stdout.buffer.write(json.dumps(d, indent=2, sort_keys=True).encode())' stats.json | sha256sum
    ```
 
-   All six files should report OK, as they did for the 2026-11-08 build. The second command should print
+   All six files should report OK, as they did for the 2026-11-08 build and for the chain-list scan of
+   2026-11-16 (`results/975019/verify-chain-list-scan.log`). The second command should print
    `2757785e8c344efc49e6ea4e632063eda0c0498031e6d8896e5cf21cf792cd3c`, the `stats.json` line of the archive's
-   `SHA256SUMS`; it does for `results/975019/btc-indexer-stats.json`, the `stats.json` of that build. The numbers
-   of the `census` object of `stats.json` are in section 7 of the rules.
+   `SHA256SUMS`; it does for `results/975019/btc-indexer-stats.json`, the `stats.json` of the 2026-11-08 build,
+   and for `results/975019/chain-list-scan-stats.json`, that of the chain-list scan. The numbers of the
+   `census` object of `stats.json` are in section 7 of the rules.
 
 ## UTXO census
 
@@ -145,6 +168,13 @@ tables; the unpacked archive works. What counts as exposed, and the
 results at block 975,019, are in section 10 of `docs/extraction-rules.md` and on
 https://snapshots.ark0.si/method.html. A full run over that snapshot with `--check-curve` took about
 26 minutes and stayed under 1 GB of memory.
+
+A node that is already past block 975,019 can still write that file. From Bitcoin Core 29.0 on,
+`bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset <file> rollback=975019` rolls the chain back to that block,
+suspends network activity while it writes the file, and rolls forward again. On 28.x, the script
+`contrib/devtools/utxo_snapshot.sh` from the source tree (`utxo_snapshot.sh 975019 <file> bitcoin-cli`) rolls
+back with `invalidateblock` and `reconsiderblock` instead. Both write snapshot format version 2. Rolling back
+needs the block data above 975,019, which a pruned node may no longer have.
 
 ## Validation scripts
 
@@ -168,7 +198,8 @@ and what it does not.
 | Command | What it does |
 | --- | --- |
 | `--self-test <json>` | Runs the self-test vectors. |
-| `--scan-blocks <blocks_dir> <out_dir>` | Full rebuild from raw block files. |
+| `--scan-blocks <blocks_dir> <out_dir> <chain_list>` | Full rebuild from raw block files, limited to the blocks of a best-chain list. |
+| `--export-chain-list <rpc_url> <cookie_file> <height> <out_file>` | Writes the best-chain list from block 0 to `<height>`, read from a node over RPC. |
 | `--apply-block-hex <index_dir> <height> <block_hash>` | Reads one raw block as hex on stdin, checks it, and writes what it publishes to `delta_blocks.jsonl`, replacing any record at that height or above. |
 | `--compact <index_dir>` | Merges `delta_blocks.jsonl` into the three main tables, then removes it. |
 | `--query <index_dir> <script_pubkey_hex>` | Prints the exposure level of one output script. |
@@ -240,9 +271,8 @@ of https://data.ark0.si) has four known problems:
 The fixed 975019 archive has no per-block data, so the last two problems do not arise. Its tables come from
 the full scan, which also never sees the spent output, but applies shape checks and keeps only hashes funded
 as the matching type: a string that is not a script gets in only when one of its hashes was itself funded as
-a P2SH or P2WSH program (sections 2.3 and 11.2, item 7, of `docs/extraction-rules.md`). Its other limits,
-among them that chain membership is not checked, are in sections 1 and 8. A redesign that makes the
-per-block updates exact is under way.
+a P2SH or P2WSH program (sections 2.3 and 11.2, item 7, of `docs/extraction-rules.md`). Its other limits are
+in section 8. A redesign that makes the per-block updates exact is under way.
 
 `/lookup/pubkey` sets `published_on_chain` only when one of the key's 12 derived hashes is in the pubkey table,
 which for the snapshot holds only hashes funded as the matching type. A key published by block 975,019 none of

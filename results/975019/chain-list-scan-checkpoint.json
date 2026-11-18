@@ -1,0 +1,67 @@
+{
+  "block_hash": "0000000000000000000158c9898f947463d71d98c97f1dad1639e25114a1dae6",
+  "files": {
+    "cross_format_diff_20.bin": {
+      "bytes": 28435480,
+      "records": 1421774,
+      "sha256": "6efa04890837b4fc62987ee0dba5c344428a96f1674d7999e9de08cb48dd0b84"
+    },
+    "cross_format_diff_32.bin": {
+      "bytes": 5928608,
+      "records": 185269,
+      "sha256": "bec9e7cd57e58d344aa37efa2972f5152ade8eb083e7d320bd6cd75ddb9ed9fe"
+    },
+    "last_indexed_height": {
+      "bytes": 7,
+      "sha256": "4f361ccf790379771ed8bf8d1be6b9e36184e0aebe8ef0cbc8a29a3a98a0b8b9"
+    },
+    "pubkey_hash_index.bin": {
+      "bytes": 25594223980,
+      "records": 1279711199,
+      "sha256": "36821d50c7b9d1511b9aabd462cfbbdbb4369894fc62a77fb18ed742ec7df5e6"
+    },
+    "script_hash_index_20.bin": {
+      "bytes": 7693746700,
+      "records": 384687335,
+      "sha256": "f8aaa8c3c7d3b583753ce7b703b2aa1aea78e3b8d7ea3cc790e95777e2f6e782"
+    },
+    "script_hash_index_32.bin": {
+      "bytes": 1255784096,
+      "records": 39243253,
+      "sha256": "6ca074f9fa4f5b1cf4b9e0a7c02b0d8be102734cc6e27f60f8c25c91f48bf54b"
+    },
+    "state/f20.bin": {
+      "bytes": 30156212688,
+      "records": 1436010128,
+      "sha256": "fd434dee83eb38eca3836bef6dbdf4122be25e58d7e5ef4282d1974d49926ea3"
+    },
+    "state/f32.bin": {
+      "bytes": 1296690688,
+      "records": 40521584,
+      "sha256": "3d2778b82523960b4146138744180d2ec9658ef841cfb46ac1618a1b8ddbc350"
+    },
+    "state/r20.bin": {
+      "bytes": 29750653422,
+      "records": 1416697782,
+      "sha256": "5f8fcacdbd9b68217aed25f706e901eef4d5ecf349e8b24a80d3db283705e63c"
+    },
+    "state/r32.bin": {
+      "bytes": 26392309185,
+      "records": 799766945,
+      "sha256": "aed7ef9d95f853bb568cefaf8e6bc9b1fd42e43e2a6c066883cf96f2df5c02b3"
+    },
+    "state/x.bin": {
+      "bytes": 58638777021,
+      "records": 1776932637,
+      "sha256": "e304a12bb22493b4bf46989c351037d2d35a8564552108dcc63e46cbc479b246"
+    },
+    "stats.json": {
+      "bytes": 1652,
+      "sha256": "5feca95f94f022e2f63e95116cda7c802d59854d91c354ad10064e4b38cc5008"
+    }
+  },
+  "format": "btc-indexer-checkpoint/1",
+  "height": 975019,
+  "rules_version": "btc-indexer/shape-rules-1",
+  "state_digest": "faa16f3894776959d7870615479b4ea71d19149712b3f2132e9313e82c62e21f"
+}

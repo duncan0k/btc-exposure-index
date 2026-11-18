@@ -1353,529 +1353,743 @@ mod census_tests {
     }
 }
 
-/// Bitflags for output types that funded a given 20-byte HASH160 on chain:
-/// bit 0 (1): P2PKH
-/// bit 1 (2): P2WPKH
-/// bit 2 (4): P2SH
-fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
-    let t0 = Instant::now();
-    let mut blk_files: Vec<PathBuf> = fs::read_dir(blocks_dir)
-        .expect("Cannot read blocks dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map_or(false, |s| s.starts_with("blk") && s.ends_with(".dat"))
-        })
-        .collect();
-    blk_files.sort();
 
-    let out_path = Path::new(out_dir);
-    let shard_dir = out_path.join("shards");
-    fs::create_dir_all(&shard_dir).unwrap();
-    fs::create_dir_all(out_dir).unwrap();
+const RULES_VERSION: &str = "btc-indexer/shape-rules-1";
+const DIGEST_FILES: [&str; 8] = [
+    "state/x.bin", "state/f20.bin", "state/f32.bin", "state/r20.bin", "state/r32.bin",
+    "pubkey_hash_index.bin", "script_hash_index_20.bin", "script_hash_index_32.bin",
+];
 
-    // Clean up any partial candidate or matched files from a previous interrupted run
-    for i in 0..64 {
-        let _ = fs::remove_file(shard_dir.join(format!("cand_{:02}.bin", i)));
-        let _ = fs::remove_file(shard_dir.join(format!("matched_{:02}.bin", i)));
+fn display_hash(hash: &[u8; 32]) -> String {
+    let mut bytes = *hash;
+    bytes.reverse();
+    hex::encode(bytes)
+}
+
+fn parse_display_hash(text: &str) -> Result<[u8; 32], String> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("expected 64 lowercase hexadecimal characters".to_string());
     }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(text, &mut bytes).map_err(|e| e.to_string())?;
+    bytes.reverse();
+    Ok(bytes)
+}
 
-    let have_h20 = (0..64).all(|i| {
-        shard_dir
-            .join(format!("h20_{:02}.bin", i))
-            .metadata()
-            .map(|m| m.len() > 0 && m.len() % 21 == 0)
-            .unwrap_or(false)
-    });
-    let have_funded = (0..64).all(|i| {
-        shard_dir
-            .join(format!("funded_{:02}.bin", i))
-            .metadata()
-            .map(|m| m.len() > 0 && m.len() % 21 == 0)
-            .unwrap_or(false)
-    });
-    let have_h32 = (0..16).all(|i| {
-        shard_dir
-            .join(format!("h32_{:02}.bin", i))
-            .metadata()
-            .map(|m| m.len() > 0 && m.len() % 33 == 0)
-            .unwrap_or(false)
-    });
-    let have_done_h32 = out_path
-        .join("script_hash_index_32.bin")
-        .metadata()
-        .map(|m| m.len() > 0 && m.len() % 32 == 0)
-        .unwrap_or(false)
-        && out_path
-            .join("cross_format_diff_32.bin")
-            .metadata()
-            .map(|m| m.len() % 32 == 0)
-            .unwrap_or(false);
-    let have_x: [bool; 64] = std::array::from_fn(|i| {
-        shard_dir
-            .join(format!("x_{:02}.bin", i))
-            .metadata()
-            .map(|m| m.len() > 0 && m.len() % 33 == 0)
-            .unwrap_or(false)
-    });
-
-    let need_h20 = !have_h20 && !have_funded;
-    let need_h32 = !have_h32 && !have_done_h32;
-    let need_any_x = have_x.iter().any(|&b| !b);
-
-    println!(
-        "[1/4] Found {} blk*.dat files in {}. Checkpoint state: have_h20={}, have_funded={}, have_h32={}, existing_x_shards={}/64",
-        blk_files.len(),
-        blocks_dir,
-        have_h20,
-        have_funded,
-        have_h32 || have_done_h32,
-        have_x.iter().filter(|&&b| b).count()
-    );
-    let _ = io::stdout().flush();
-
-    if need_h20 || need_h32 || need_any_x {
-        let x_shards: Vec<Option<Mutex<BufWriter<File>>>> = (0..64)
-            .map(|i| {
-                if have_x[i] {
-                    None
-                } else {
-                    Some(Mutex::new(BufWriter::with_capacity(
-                        256 * 1024,
-                        File::create(shard_dir.join(format!("x_{:02}.bin", i))).unwrap(),
-                    )))
-                }
-            })
-            .collect();
-        let h20_shards: Vec<Option<Mutex<BufWriter<File>>>> = (0..64)
-            .map(|i| {
-                if !need_h20 {
-                    None
-                } else {
-                    Some(Mutex::new(BufWriter::with_capacity(
-                        256 * 1024,
-                        File::create(shard_dir.join(format!("h20_{:02}.bin", i))).unwrap(),
-                    )))
-                }
-            })
-            .collect();
-        let h32_shards: Vec<Option<Mutex<BufWriter<File>>>> = (0..16)
-            .map(|i| {
-                if !need_h32 {
-                    None
-                } else {
-                    Some(Mutex::new(BufWriter::with_capacity(
-                        256 * 1024,
-                        File::create(shard_dir.join(format!("h32_{:02}.bin", i))).unwrap(),
-                    )))
-                }
-            })
-            .collect();
-
-        let flush_local = |lx: &mut FxHashMap<[u8; 32], u8>,
-                           lh20: &mut FxHashMap<[u8; 20], u8>,
-                           lh32: &mut FxHashMap<[u8; 32], u8>| {
-            if !lx.is_empty() {
-                let mut buckets: Vec<Vec<u8>> = (0..64).map(|_| Vec::new()).collect();
-                for (k, v) in lx.drain() {
-                    let b = (k[0] >> 2) as usize;
-                    if !have_x[b] {
-                        buckets[b].extend_from_slice(&k);
-                        buckets[b].push(v);
-                    }
-                }
-                for (i, buf) in buckets.into_iter().enumerate() {
-                    if !buf.is_empty() {
-                        if let Some(ref writer) = x_shards[i] {
-                            writer.lock().unwrap().write_all(&buf).unwrap();
-                        }
-                    }
-                }
-            }
-            if !lh20.is_empty() {
-                let mut buckets: Vec<Vec<u8>> = (0..64).map(|_| Vec::new()).collect();
-                for (k, v) in lh20.drain() {
-                    let b = (k[0] >> 2) as usize;
-                    buckets[b].extend_from_slice(&k);
-                    buckets[b].push(v);
-                }
-                for (i, buf) in buckets.into_iter().enumerate() {
-                    if !buf.is_empty() {
-                        if let Some(ref writer) = h20_shards[i] {
-                            writer.lock().unwrap().write_all(&buf).unwrap();
-                        }
-                    }
-                }
-            }
-            if !lh32.is_empty() {
-                let mut buckets: Vec<Vec<u8>> = (0..16).map(|_| Vec::new()).collect();
-                for (k, v) in lh32.drain() {
-                    let b = (k[0] >> 4) as usize;
-                    buckets[b].extend_from_slice(&k);
-                    buckets[b].push(v);
-                }
-                for (i, buf) in buckets.into_iter().enumerate() {
-                    if !buf.is_empty() {
-                        if let Some(ref writer) = h32_shards[i] {
-                            writer.lock().unwrap().write_all(&buf).unwrap();
-                        }
-                    }
-                }
-            }
+fn parse_chain_list(bytes: &[u8]) -> Result<Vec<[u8; 32]>, String> {
+    if bytes.is_empty() { return Err("chain list line 1: empty file".to_string()); }
+    if bytes.last() != Some(&b'\n') {
+        return Err(format!("chain list line {}: missing final line feed",
+            bytes.iter().filter(|&&b| b == b'\n').count() + 1));
+    }
+    let mut hashes = Vec::new();
+    let mut seen = FxHashSet::default();
+    for (i, line) in bytes[..bytes.len() - 1].split(|&b| b == b'\n').enumerate() {
+        let parse = || -> Result<[u8; 32], String> {
+            let line = std::str::from_utf8(line).map_err(|_| "non-ASCII content".to_string())?;
+            let (height, hash) = line.split_once(' ').ok_or_else(|| "expected <height> <hash>".to_string())?;
+            if height != i.to_string() { return Err(format!("expected height {}", i)); }
+            parse_display_hash(hash)
         };
-
-        let total_blocks = std::sync::atomic::AtomicUsize::new(0);
-        let total_txs = std::sync::atomic::AtomicUsize::new(0);
-        let files_done = std::sync::atomic::AtomicUsize::new(0);
-        let total_files = blk_files.len();
-
-        let io_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(6)
-            .build()
-            .unwrap();
-
-        io_pool.install(|| {
-            blk_files.par_iter().for_each(|path| {
-                let Ok(mut file) = File::open(path) else { return };
-                let mut buf = Vec::with_capacity(135 * 1024 * 1024);
-                if file.read_to_end(&mut buf).is_err() {
-                    return;
-                }
-                let mut local_x: FxHashMap<[u8; 32], u8> = FxHashMap::default();
-                let mut local_h20: FxHashMap<[u8; 20], u8> = FxHashMap::default();
-                let mut local_h32: FxHashMap<[u8; 32], u8> = FxHashMap::default();
-
-                let mut b_count = 0usize;
-                let mut tx_count = 0usize;
-                let mut pos = 0;
-
-                let mut record_x = |lx: &mut FxHashMap<[u8; 32], u8>, data: &[u8], xonly: bool, flags: u8| {
-                    let first_byte = if xonly {
-                        if data.len() == 32 {
-                            data[0]
-                        } else {
-                            return;
-                        }
-                    } else if data.len() == 33 || data.len() == 65 {
-                        data[1]
-                    } else {
-                        return;
-                    };
-                    if have_x[(first_byte >> 2) as usize] {
-                        return;
-                    }
-                    if let Some(x) = fast_candidate_x(data, xonly) {
-                        *lx.entry(x).or_insert(0) |= flags;
-                    }
-                };
-
-                while pos + 8 <= buf.len() {
-                    if buf[pos..pos + 4] != [0xf9, 0xbe, 0xb4, 0xd9] {
-                        pos += 1;
-                        continue;
-                    }
-                    let size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
-                    pos += 8;
-                    if size < 80 || pos + size > buf.len() {
-                        break;
-                    }
-                    let block_slice = &buf[pos..pos + size];
-                    pos += size;
-                    b_count += 1;
-
-                    let mut r = Reader::new(&block_slice[80..]);
-                    let Some(ntx) = r.count() else { continue };
-                    for _ in 0..ntx {
-                        let Some(tx) = parse_transaction_from_reader(&mut r) else {
-                            break;
-                        };
-                        tx_count += 1;
-
-                        // 1. Scan outputs
-                        for out in &tx.outputs {
-                            for (_, d) in Instructions::new(out) {
-                                if let Some(data) = d {
-                                    record_x(&mut local_x, data, false, 1 | 2 | 16);
-                                }
-                            }
-                            match recognize(out, false) {
-                                Recognized::P2PK(k) => {
-                                    record_x(&mut local_x, k, false, 1 | 2 | 4 | 32);
-                                }
-                                Recognized::Multisig { keys, .. } => {
-                                    for k in keys {
-                                        record_x(&mut local_x, k, false, 1 | 2 | 32);
-                                    }
-                                }
-                                Recognized::P2PKH(h) => {
-                                    if need_h20 {
-                                        *local_h20.entry(h).or_insert(0) |= 1;
-                                    }
-                                }
-                                Recognized::P2WPKH(h) => {
-                                    if need_h20 {
-                                        *local_h20.entry(h).or_insert(0) |= 2;
-                                    }
-                                }
-                                Recognized::P2SH(h) => {
-                                    if need_h20 {
-                                        *local_h20.entry(h).or_insert(0) |= 4;
-                                    }
-                                }
-                                Recognized::P2WSH(h) | Recognized::P2MR(h) => {
-                                    if need_h32 {
-                                        *local_h32.entry(h).or_insert(0) |= 1;
-                                    }
-                                }
-                                Recognized::P2TR(prog) => {
-                                    record_x(&mut local_x, prog, true, 1 | 2 | 8);
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        // 2. Scan inputs & witnesses
-                        for ((is_cb, script_sig), witness) in tx.inputs.iter().zip(tx.witnesses.iter()) {
-                            let mut last_push: Option<&[u8]> = None;
-                            let mut push_count = 0usize;
-                            for (_, d) in Instructions::new(script_sig) {
-                                if let Some(data) = d {
-                                    push_count += 1;
-                                    last_push = Some(data);
-                                    record_x(&mut local_x, data, false, 1 | 32);
-                                }
-                            }
-                            for elem in witness {
-                                record_x(&mut local_x, elem, false, 1 | 32);
-                            }
-                            if *is_cb {
-                                continue;
-                            }
-
-                            if let Some(redeem) = last_push {
-                                let is_p2pkh_pubkey = push_count == 2
-                                    && (redeem.len() == 33 || redeem.len() == 65)
-                                    && fast_candidate_x(redeem, false).is_some();
-                                if !is_p2pkh_pubkey && !redeem.is_empty() {
-                                    if need_h20 || need_h32 {
-                                        let h = hash160(redeem);
-                                        if need_h20 {
-                                            *local_h20.entry(h).or_insert(0) |= 8;
-                                        }
-                                        let sha = sha256(redeem);
-                                        let mut w = [0u8; 34];
-                                        w[0] = 0x00;
-                                        w[1] = 0x20;
-                                        w[2..34].copy_from_slice(&sha);
-                                        if need_h20 {
-                                            let w_h160 = hash160(&w);
-                                            *local_h20.entry(w_h160).or_insert(0) |= 8 | 16;
-                                        }
-                                        if need_h32 {
-                                            *local_h32.entry(sha).or_insert(0) |= 2 | 4;
-                                        }
-                                    }
-                                    for (_, d) in Instructions::new(redeem) {
-                                        if let Some(data) = d {
-                                            record_x(&mut local_x, data, false, 1 | 2 | 32);
-                                        }
-                                    }
-                                    if let Recognized::P2WSH(_) = recognize(redeem, false) {
-                                        if let Some(&wscript) = witness.last() {
-                                            if need_h20 || need_h32 {
-                                                let wsha = sha256(wscript);
-                                                if need_h20 {
-                                                    let ws_h160 = hash160(wscript);
-                                                    *local_h20.entry(ws_h160).or_insert(0) |= 8 | 16;
-                                                    let mut ww = [0u8; 34];
-                                                    ww[0] = 0x00;
-                                                    ww[1] = 0x20;
-                                                    ww[2..34].copy_from_slice(&wsha);
-                                                    *local_h20.entry(hash160(&ww)).or_insert(0) |= 8;
-                                                }
-                                                if need_h32 {
-                                                    *local_h32.entry(wsha).or_insert(0) |= 2 | 4;
-                                                }
-                                            }
-                                            for (_, d) in Instructions::new(wscript) {
-                                                if let Some(data) = d {
-                                                    record_x(&mut local_x, data, false, 1 | 2 | 32);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if script_sig.is_empty() && !witness.is_empty() {
-                                let last_w = witness[witness.len() - 1];
-                                let is_p2wpkh_spend = witness.len() == 2
-                                    && (last_w.len() == 33 || last_w.len() == 65)
-                                    && fast_candidate_x(last_w, false).is_some();
-                                if !is_p2wpkh_spend {
-                                    let mut stack = witness.as_slice();
-                                    if stack.len() >= 2 && stack.last().unwrap().starts_with(&[0x50]) {
-                                        stack = &stack[..stack.len() - 1];
-                                    }
-                                    let mut is_p2tr_script = false;
-                                    if stack.len() >= 2 {
-                                        let script = stack[stack.len() - 2];
-                                        let control = stack[stack.len() - 1];
-                                        if control.len() >= 33
-                                            && (control.len() - 33) % 32 == 0
-                                            && (control.len() - 33) / 32 <= 128
-                                        {
-                                            if let Some(ix) = key_x(&control[1..33], true) {
-                                                is_p2tr_script = true;
-                                                if !have_x[(ix[0] >> 2) as usize] {
-                                                    *local_x.entry(ix).or_insert(0) |= 1 | 2 | 32;
-                                                }
-                                                if need_h20 || need_h32 {
-                                                    let wsha_s = sha256(script);
-                                                    if need_h32 {
-                                                        *local_h32.entry(wsha_s).or_insert(0) |= 2 | 4;
-                                                    }
-                                                    if need_h20 {
-                                                        let sh_s = hash160(script);
-                                                        *local_h20.entry(sh_s).or_insert(0) |= 8 | 16;
-                                                        let mut ww = [0u8; 34];
-                                                        ww[0] = 0x00;
-                                                        ww[1] = 0x20;
-                                                        ww[2..34].copy_from_slice(&wsha_s);
-                                                        *local_h20.entry(hash160(&ww)).or_insert(0) |= 8 | 16;
-                                                    }
-                                                    if need_h32 {
-                                                        let mut path =
-                                                            Vec::with_capacity((control.len() - 33) / 32);
-                                                        for i in (33..control.len()).step_by(32) {
-                                                            let mut h = [0u8; 32];
-                                                            h.copy_from_slice(&control[i..i + 32]);
-                                                            path.push(h);
-                                                        }
-                                                        let version = control[0] & 254;
-                                                        let leaf = RevealedLeaf {
-                                                            version,
-                                                            script: script.to_vec(),
-                                                            path,
-                                                        };
-                                                        for lh in leaf_hashes(&leaf) {
-                                                            *local_h32.entry(lh).or_insert(0) |= 2 | 4;
-                                                        }
-                                                    }
-                                                }
-                                                let version = control[0] & 254;
-                                                for (_, d) in Instructions::new(script) {
-                                                    if let Some(data) = d {
-                                                        if data.len() == 33 || data.len() == 65 {
-                                                            if !have_x[(data[1] >> 2) as usize] {
-                                                                if let Some(x) = key_x(data, false) {
-                                                                    *local_x.entry(x).or_insert(0) |= 1 | 2 | 32;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                if version == 192 {
-                                                    let ops: Vec<(u8, Option<&[u8]>)> =
-                                                        Instructions::new(script).collect();
-                                                    for w in ops.windows(2) {
-                                                        if let Some(data) = w[0].1 {
-                                                            if matches!(w[1].0, 172 | 173 | 186) && data.len() == 32 {
-                                                                if !have_x[(data[0] >> 2) as usize] {
-                                                                    if let Some(x) = key_x(data, true) {
-                                                                        *local_x.entry(x).or_insert(0) |= 1 | 2 | 32;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !is_p2tr_script && !last_w.is_empty() {
-                                        if need_h20 || need_h32 {
-                                            let wsha = sha256(last_w);
-                                            if need_h32 {
-                                                *local_h32.entry(wsha).or_insert(0) |= 2;
-                                            }
-                                            if need_h20 {
-                                                let sh_direct = hash160(last_w);
-                                                *local_h20.entry(sh_direct).or_insert(0) |= 8 | 16;
-                                                let mut ww = [0u8; 34];
-                                                ww[0] = 0x00;
-                                                ww[1] = 0x20;
-                                                ww[2..34].copy_from_slice(&wsha);
-                                                *local_h20.entry(hash160(&ww)).or_insert(0) |= 8 | 16;
-                                            }
-                                        }
-                                        for (_, d) in Instructions::new(last_w) {
-                                            if let Some(data) = d {
-                                                record_x(&mut local_x, data, false, 1 | 2 | 32);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if local_x.len() + local_h20.len() + local_h32.len() >= 1_500_000 {
-                            flush_local(&mut local_x, &mut local_h20, &mut local_h32);
-                        }
-                    }
-                }
-
-                flush_local(&mut local_x, &mut local_h20, &mut local_h32);
-                total_blocks.fetch_add(b_count, std::sync::atomic::Ordering::Relaxed);
-                total_txs.fetch_add(tx_count, std::sync::atomic::Ordering::Relaxed);
-                let done = files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if done % 250 == 0 || done == total_files {
-                    println!(
-                        "  -> [1/4] Scanned {} / {} blk files ({:.1}%) in {:.1}s",
-                        done,
-                        total_files,
-                        (done as f64 * 100.0) / (total_files as f64),
-                        t0.elapsed().as_secs_f64()
-                    );
-                    let _ = io::stdout().flush();
-                }
-            });
-        });
-
-        drop(x_shards);
-        drop(h20_shards);
-        drop(h32_shards);
-
-        println!(
-            "[1.5/4] Block scan finished in {:.1}s ({} blocks, {} txs).",
-            t0.elapsed().as_secs_f64(),
-            total_blocks.load(std::sync::atomic::Ordering::Relaxed),
-            total_txs.load(std::sync::atomic::Ordering::Relaxed)
-        );
-        let _ = io::stdout().flush();
+        let hash = parse().map_err(|e| format!("chain list line {}: {}", i + 1, e))?;
+        if !seen.insert(hash) { return Err(format!("chain list line {}: duplicate hash", i + 1)); }
+        hashes.push(hash);
     }
+    Ok(hashes)
+}
 
+#[derive(Serialize)]
+struct ScanFileInfo {
+    bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    records: Option<u64>,
+    sha256: String,
+}
+
+// Sync all scan files before publication; compute digests while writing.
+struct ScanWriter {
+    path: PathBuf,
+    tmp: PathBuf,
+    out: BufWriter<File>,
+    hasher: Sha256,
+    bytes: u64,
+    previous: Option<Vec<u8>>,
+}
+
+impl ScanWriter {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+            .map_err(|e| format!("{} byte offset 0: create: {}", tmp.display(), e))?;
+        Ok(Self { path, tmp, out: BufWriter::with_capacity(256 * 1024, file),
+            hasher: Sha256::new(), bytes: 0, previous: None })
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.out.write_all(bytes).map_err(|e|
+            format!("{} byte offset {}: write: {}", self.tmp.display(), self.bytes, e))?;
+        self.hasher.update(bytes);
+        self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+    fn record(&mut self, key: &[u8], suffix: &[u8]) -> Result<(), String> {
+        if self.previous.as_deref().is_some_and(|p| p >= key) {
+            return Err(format!("{} byte offset {}: keys not strictly increasing", self.path.display(), self.bytes));
+        }
+        self.write_all(key)?;
+        self.write_all(suffix)?;
+        let previous = self.previous.get_or_insert_with(Vec::new);
+        previous.clear();
+        previous.extend_from_slice(key);
+        Ok(())
+    }
+    fn finish(self, width: Option<u64>) -> Result<ScanFileInfo, String> {
+        if width.is_some_and(|w| w == 0 || self.bytes % w != 0) {
+            return Err(format!("{}: invalid record size", self.path.display()));
+        }
+        drop(finish_synced_file(self.out, &self.tmp)?);
+        fs::rename(&self.tmp, &self.path).map_err(|e|
+            format!("{}: rename to {}: {}", self.tmp.display(), self.path.display(), e))?;
+        sync_parent(&self.path)?;
+        Ok(ScanFileInfo { bytes: self.bytes, records: width.map(|w| self.bytes / w),
+            sha256: hex::encode(self.hasher.finalize()) })
+    }
+}
+
+fn finish_scan_output(writer: ScanWriter, files: &mut std::collections::BTreeMap<String, ScanFileInfo>,
+    name: &str, width: Option<u64>) -> Result<(), String> {
+    files.insert(name.to_string(), writer.finish(width)?);
+    Ok(())
+}
+
+fn write_scan_output(out: &Path, files: &mut std::collections::BTreeMap<String, ScanFileInfo>,
+    name: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut writer = ScanWriter::new(out.join(name))?;
+    writer.write_all(bytes)?;
+    finish_scan_output(writer, files, name, None)
+}
+
+fn state_digest(rules: &str, height: u64, display_block_hash: &[u8; 32],
+    hashes: &[[u8; 32]; 8]) -> Result<[u8; 32], String> {
+    let length = u8::try_from(rules.len()).map_err(|_| "rules version too long".to_string())?;
+    if !rules.is_ascii() { return Err("rules version is not ASCII".to_string()); }
+    let mut hasher = Sha256::new();
+    hasher.update([length]);
+    hasher.update(rules.as_bytes());
+    hasher.update(height.to_be_bytes());
+    hasher.update(display_block_hash);
+    for hash in hashes { hasher.update(hash); }
+    Ok(hasher.finalize().into())
+}
+
+fn read_scan_shard(path: &Path, width: usize) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{} byte offset 0: read: {}", path.display(), e))?;
+    if bytes.len() % width != 0 {
+        return Err(format!("{} byte offset {}: truncated record", path.display(), bytes.len()));
+    }
+    fs::remove_file(path).map_err(|e| format!("{}: remove: {}", path.display(), e))?;
+    Ok(bytes)
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    for c in bytes.chunks(3) {
+        let value = ((c[0] as u32) << 16) | ((c.get(1).copied().unwrap_or(0) as u32) << 8)
+            | c.get(2).copied().unwrap_or(0) as u32;
+        for i in 0..4 {
+            result.push(if i > c.len() { '=' } else { ALPHABET[((value >> (18 - i * 6)) & 63) as usize] as char });
+        }
+    }
+    result
+}
+
+struct ChainRpc { authority: String, auth: String }
+impl ChainRpc {
+    fn new(url: &str, cookie: &Path) -> Result<Self, String> {
+        let authority = url.strip_prefix("http://").and_then(|s| s.strip_suffix('/'))
+            .ok_or_else(|| "RPC URL must be http://<host>:<port>/".to_string())?;
+        let (host, port) = authority.rsplit_once(':').ok_or_else(|| "RPC URL requires a port".to_string())?;
+        if host.is_empty() || host.bytes().any(|b| b.is_ascii_whitespace() || b"/?#@".contains(&b))
+            || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().ok().filter(|&p| p != 0).is_none()
+            || (!host.starts_with('[') && host.contains(':')) {
+            return Err("RPC URL must be http://<host>:<port>/".to_string());
+        }
+        let cookie_text = fs::read_to_string(cookie).map_err(|e| format!("{}: read cookie: {}", cookie.display(), e))?;
+        let cookie_text = cookie_text.trim_end();
+        if !cookie_text.starts_with("__cookie__:") || cookie_text.len() == 11
+            || cookie_text.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(format!("{}: invalid RPC cookie", cookie.display()));
+        }
+        Ok(Self { authority: authority.to_string(), auth: base64(cookie_text.as_bytes()) })
+    }
+    fn request(&self, value: &serde_json::Value) -> Result<serde_json::Value, String> {
+        use std::net::TcpStream;
+        let body = serde_json::to_vec(value).map_err(|e| format!("RPC request JSON: {}", e))?;
+        let mut socket = TcpStream::connect(&self.authority).map_err(|e| format!("RPC connect: {}", e))?;
+        socket.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| format!("RPC timeout: {}", e))?;
+        socket.set_write_timeout(Some(Duration::from_secs(60))).map_err(|e| format!("RPC timeout: {}", e))?;
+        write!(socket, "POST / HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.authority, self.auth, body.len()).map_err(|e| format!("RPC write headers: {}", e))?;
+        socket.write_all(&body).map_err(|e| format!("RPC write body: {}", e))?;
+        let mut reader = BufReader::new(socket);
+        let mut header = Vec::new();
+        loop {
+            if header.len() >= 65536 { return Err("RPC response headers too large".to_string()); }
+            let mut b = [0];
+            reader.read_exact(&mut b).map_err(|e| format!("RPC read headers: {}", e))?;
+            header.push(b[0]);
+            if header.ends_with(b"\r\n\r\n") { break; }
+        }
+        let header = std::str::from_utf8(&header).map_err(|_| "RPC invalid HTTP headers".to_string())?;
+        let mut lines = header.split("\r\n");
+        let status = lines.next().ok_or_else(|| "RPC missing HTTP status".to_string())?;
+        let mut fields = status.split_whitespace();
+        if fields.next() != Some("HTTP/1.1") || fields.next() != Some("200") {
+            return Err("RPC requires HTTP/1.1 status 200".to_string());
+        }
+        let mut length = None;
+        for line in lines.filter(|l| !l.is_empty()) {
+            let (name, value) = line.split_once(':').ok_or_else(|| "RPC malformed HTTP header".to_string())?;
+            if name.eq_ignore_ascii_case("transfer-encoding") { return Err("RPC Transfer-Encoding unsupported".to_string()); }
+            if name.eq_ignore_ascii_case("content-length") {
+                if length.is_some() { return Err("RPC duplicate Content-Length".to_string()); }
+                let text = value.trim();
+                if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("RPC invalid Content-Length".to_string());
+                }
+                length = Some(text.parse::<usize>().map_err(|_| "RPC invalid Content-Length".to_string())?);
+            }
+        }
+        let length = length.ok_or_else(|| "RPC missing Content-Length".to_string())?;
+        if length > 16 * 1024 * 1024 { return Err("RPC response too large".to_string()); }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).map_err(|e| format!("RPC read body: {}", e))?;
+        serde_json::from_slice(&body).map_err(|e| format!("RPC invalid response JSON: {}", e))
+    }
+    fn result(response: &serde_json::Value, id: u64) -> Result<&serde_json::Value, String> {
+        if !response.is_object() || response["id"].as_u64() != Some(id)
+            || response.get("error").is_some_and(|e| !e.is_null()) {
+            return Err(format!("RPC invalid response or error for id {}", id));
+        }
+        response.get("result").ok_or_else(|| format!("RPC missing result for id {}", id))
+    }
+    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let response = self.request(&serde_json::json!({"jsonrpc":"1.0","id":0,"method":method,"params":params}))?;
+        Ok(Self::result(&response, 0)?.clone())
+    }
+    fn info(&self) -> Result<u64, String> {
+        let info = self.call("getblockchaininfo", serde_json::json!([]))?;
+        if info["initialblockdownload"].as_bool() != Some(false) { return Err("RPC node is in IBD or missing IBD status".to_string()); }
+        let blocks = info["blocks"].as_u64().ok_or_else(|| "RPC invalid blocks".to_string())?;
+        if info["headers"].as_u64() != Some(blocks) { return Err("RPC blocks and headers differ".to_string()); }
+        Ok(blocks)
+    }
+}
+
+fn export_chain_list(url: &str, cookie: &Path, height: u64, out: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(out) {
+        Ok(_) => return Err(format!("{}: refusing to overwrite existing file", out.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("{}: metadata: {}", out.display(), e)),
+    }
+    let rpc = ChainRpc::new(url, cookie)?;
+    let depth = height.checked_add(100).ok_or_else(|| "export height overflow".to_string())?;
+    let tip = rpc.info()?;
+    if depth > tip { return Err(format!("height {} requires at least 100 confirmations below tip {}", height, tip)); }
+    let mut writer = ScanWriter::new(out.to_path_buf())?;
+    let mut seen = FxHashSet::default();
+    let mut final_hash = [0; 32];
+    let mut start = 0u64;
+    loop {
+        let end = start.saturating_add(999).min(height);
+        let calls: Vec<_> = (start..=end).map(|h| serde_json::json!(
+            {"jsonrpc":"1.0","id":h,"method":"getblockhash","params":[h]})).collect();
+        let response = rpc.request(&serde_json::Value::Array(calls))?;
+        let results = response.as_array().ok_or_else(|| "RPC batch result is not an array".to_string())?;
+        let mut by_id = std::collections::BTreeMap::new();
+        for result in results {
+            let id = result["id"].as_u64().filter(|&id| id >= start && id <= end)
+                .ok_or_else(|| "RPC unexpected batch id".to_string())?;
+            let text = ChainRpc::result(result, id)?.as_str().ok_or_else(|| format!("RPC hash at height {} is not text", id))?;
+            let hash = parse_display_hash(text).map_err(|e| format!("RPC hash at height {}: {}", id, e))?;
+            if by_id.insert(id, hash).is_some() || !seen.insert(hash) { return Err(format!("RPC duplicate result at height {}", id)); }
+        }
+        for h in start..=end {
+            let hash = by_id.get(&h).ok_or_else(|| format!("RPC missing batch id {}", h))?;
+            writer.write_all(format!("{} {}\n", h, display_hash(hash)).as_bytes())?;
+            final_hash = *hash;
+        }
+        if end == height { break; }
+        start = end + 1;
+    }
+    let final_tip = rpc.info()?;
+    let recheck = rpc.call("getblockhash", serde_json::json!([height]))?;
+    let recheck = recheck.as_str().ok_or_else(|| "RPC recheck hash is not text".to_string())?;
+    if parse_display_hash(recheck)? != final_hash || depth > final_tip {
+        return Err(format!("chain changed during export at height {}", height));
+    }
+    // Refuse overwrites again to protect destination files created during export.
+    if out.try_exists().map_err(|e| format!("{}: metadata: {}", out.display(), e))? {
+        return Err(format!("{}: refusing to overwrite existing file", out.display()));
+    }
+    writer.finish(None)?;
+    println!("Exported chain list: tip={}, H={}, hash={}", tip, height, display_hash(&final_hash));
+    Ok(())
+}
+
+struct BlockExtract {
+    x: FxHashMap<[u8; 32], u8>,
+    h20: FxHashMap<[u8; 20], u8>,
+    h32: FxHashMap<[u8; 32], u8>,
+    transactions: usize,
+}
+
+fn unmutated_merkle_root(mut hashes: Vec<[u8; 32]>) -> Result<[u8; 32], String> {
+    if hashes.is_empty() { return Err("empty merkle tree".to_string()); }
+    while hashes.len() > 1 {
+        let mut next = Vec::with_capacity((hashes.len() + 1) / 2);
+        for pair in hashes.chunks(2) {
+            if pair.len() == 2 && pair[0] == pair[1] { return Err("mutated merkle tree".to_string()); }
+            let mut bytes = [0; 64];
+            bytes[..32].copy_from_slice(&pair[0]);
+            bytes[32..].copy_from_slice(pair.get(1).unwrap_or(&pair[0]));
+            next.push(double_sha256(&bytes));
+        }
+        hashes = next;
+    }
+    Ok(hashes[0])
+}
+
+fn extract_block(block: &[u8], height: u64, expected_hash: &[u8; 32],
+    expected_prev: &[u8; 32]) -> Result<BlockExtract, String> {
+    let error = |offset: usize, message: &str| format!("height {} hash {} byte offset {}: {}",
+        height, display_hash(expected_hash), offset, message);
+    if block.len() < 80 { return Err(error(block.len(), "short header")); }
+    if double_sha256(&block[..80]) != *expected_hash { return Err(error(0, "header hash mismatch")); }
+    if block[4..36] != expected_prev[..] || (height == 0 && *expected_prev != [0; 32]) {
+        return Err(error(4, "previous block hash mismatch"));
+    }
+    let mut r = Reader::new(&block[80..]);
+    let ntx = r.count().filter(|&n| n != 0).ok_or_else(|| error(80, "missing or zero transaction count"))?;
+    let mut txs = Vec::with_capacity(capped_capacity(ntx, block.len() - 80));
+    let mut txids = Vec::new();
+    let mut wtxids = Vec::new();
+    let mut has_witness = false;
+    for i in 0..ntx {
+        let start = r.pos;
+        let tx = parse_transaction_from_reader(&mut r)
+            .ok_or_else(|| error(80 + start, &format!("transaction {} does not parse", i)))?;
+        let (txid, wtxid) = transaction_hashes(&r.data[start..r.pos], &tx)
+            .map_err(|e| error(80 + start, &e))?;
+        has_witness |= tx.witnesses.iter().any(|w| !w.is_empty());
+        txids.push(txid);
+        wtxids.push(if i == 0 { [0; 32] } else { wtxid });
+        txs.push(tx);
+    }
+    if r.pos != r.data.len() { return Err(error(80 + r.pos, "trailing bytes")); }
+    if unmutated_merkle_root(txids).map_err(|e| error(36, &e))? != block[36..68] {
+        return Err(error(36, "transaction merkle root mismatch"));
+    }
+    let coinbase = &txs[0];
+    let commit_pos = coinbase.outputs.iter().rposition(|out|
+        out.len() >= 38 && out.starts_with(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]));
+    if has_witness || (commit_pos.is_some() && height >= SEGWIT_ACTIVATION_HEIGHT) {
+        let pos = commit_pos.ok_or_else(|| error(81, "missing witness commitment output"))?;
+        let reserved = coinbase.witnesses.first().filter(|w| w.len() == 1 && w[0].len() == 32)
+            .ok_or_else(|| error(81, "invalid witness reserved value"))?;
+        let mut bytes = [0; 64];
+        bytes[..32].copy_from_slice(&merkle_root(wtxids).map_err(|e| error(81, &e))?);
+        bytes[32..].copy_from_slice(reserved[0]);
+        if double_sha256(&bytes) != coinbase.outputs[pos][6..38] { return Err(error(81, "witness commitment mismatch")); }
+    }
+    let mut local_x = FxHashMap::default();
+    let mut local_h20 = FxHashMap::default();
+    let mut local_h32 = FxHashMap::default();
+    let record_x = |lx: &mut FxHashMap<[u8; 32], u8>, data: &[u8], xonly: bool, flags: u8| {
+        if let Some(x) = fast_candidate_x(data, xonly) { *lx.entry(x).or_insert(0) |= flags; }
+    };
+    for tx in txs {
+        // 1. Scan outputs
+        for out in &tx.outputs {
+            for (_, d) in Instructions::new(out) {
+                if let Some(data) = d {
+                    record_x(&mut local_x, data, false, 1 | 2 | 16);
+                }
+            }
+            match recognize(out, false) {
+                Recognized::P2PK(k) => {
+                    record_x(&mut local_x, k, false, 1 | 2 | 4 | 32);
+                }
+                Recognized::Multisig { keys, .. } => {
+                    for k in keys {
+                        record_x(&mut local_x, k, false, 1 | 2 | 32);
+                    }
+                }
+                Recognized::P2PKH(h) => {
+                    *local_h20.entry(h).or_insert(0) |= 1;
+                }
+                Recognized::P2WPKH(h) => {
+                    *local_h20.entry(h).or_insert(0) |= 2;
+                }
+                Recognized::P2SH(h) => {
+                    *local_h20.entry(h).or_insert(0) |= 4;
+                }
+                Recognized::P2WSH(h) | Recognized::P2MR(h) => {
+                    *local_h32.entry(h).or_insert(0) |= 1;
+                }
+                Recognized::P2TR(prog) => {
+                    record_x(&mut local_x, prog, true, 1 | 2 | 8);
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Scan inputs & witnesses
+        for ((is_cb, script_sig), witness) in tx.inputs.iter().zip(tx.witnesses.iter()) {
+            let mut last_push: Option<&[u8]> = None;
+            let mut push_count = 0usize;
+            for (_, d) in Instructions::new(script_sig) {
+                if let Some(data) = d {
+                    push_count += 1;
+                    last_push = Some(data);
+                    record_x(&mut local_x, data, false, 1 | 32);
+                }
+            }
+            for elem in witness {
+                record_x(&mut local_x, elem, false, 1 | 32);
+            }
+            if *is_cb {
+                continue;
+            }
+
+            if let Some(redeem) = last_push {
+                let is_p2pkh_pubkey = push_count == 2
+                    && (redeem.len() == 33 || redeem.len() == 65)
+                    && fast_candidate_x(redeem, false).is_some();
+                if !is_p2pkh_pubkey && !redeem.is_empty() {
+                    let h = hash160(redeem);
+                    *local_h20.entry(h).or_insert(0) |= 8;
+                    let sha = sha256(redeem);
+                    let mut w = [0u8; 34];
+                    w[0] = 0x00;
+                    w[1] = 0x20;
+                    w[2..34].copy_from_slice(&sha);
+                    let w_h160 = hash160(&w);
+                    *local_h20.entry(w_h160).or_insert(0) |= 8 | 16;
+                    *local_h32.entry(sha).or_insert(0) |= 2 | 4;
+                    for (_, d) in Instructions::new(redeem) {
+                        if let Some(data) = d {
+                            record_x(&mut local_x, data, false, 1 | 2 | 32);
+                        }
+                    }
+                    if let Recognized::P2WSH(_) = recognize(redeem, false) {
+                        if let Some(&wscript) = witness.last() {
+                            let wsha = sha256(wscript);
+                            let ws_h160 = hash160(wscript);
+                            *local_h20.entry(ws_h160).or_insert(0) |= 8 | 16;
+                            let mut ww = [0u8; 34];
+                            ww[0] = 0x00;
+                            ww[1] = 0x20;
+                            ww[2..34].copy_from_slice(&wsha);
+                            *local_h20.entry(hash160(&ww)).or_insert(0) |= 8;
+                            *local_h32.entry(wsha).or_insert(0) |= 2 | 4;
+                            for (_, d) in Instructions::new(wscript) {
+                                if let Some(data) = d {
+                                    record_x(&mut local_x, data, false, 1 | 2 | 32);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if script_sig.is_empty() && !witness.is_empty() {
+                let last_w = witness[witness.len() - 1];
+                let is_p2wpkh_spend = witness.len() == 2
+                    && (last_w.len() == 33 || last_w.len() == 65)
+                    && fast_candidate_x(last_w, false).is_some();
+                if !is_p2wpkh_spend {
+                    let mut stack = witness.as_slice();
+                    if stack.len() >= 2 && stack[stack.len() - 1].starts_with(&[0x50]) {
+                        stack = &stack[..stack.len() - 1];
+                    }
+                    let mut is_p2tr_script = false;
+                    if stack.len() >= 2 {
+                        let script = stack[stack.len() - 2];
+                        let control = stack[stack.len() - 1];
+                        if control.len() >= 33
+                            && (control.len() - 33) % 32 == 0
+                            && (control.len() - 33) / 32 <= 128
+                        {
+                            if let Some(ix) = key_x(&control[1..33], true) {
+                                is_p2tr_script = true;
+                                *local_x.entry(ix).or_insert(0) |= 1 | 2 | 32;
+                                let wsha_s = sha256(script);
+                                *local_h32.entry(wsha_s).or_insert(0) |= 2 | 4;
+                                let sh_s = hash160(script);
+                                *local_h20.entry(sh_s).or_insert(0) |= 8 | 16;
+                                let mut ww = [0u8; 34];
+                                ww[0] = 0x00;
+                                ww[1] = 0x20;
+                                ww[2..34].copy_from_slice(&wsha_s);
+                                *local_h20.entry(hash160(&ww)).or_insert(0) |= 8 | 16;
+                                let mut path =
+                                    Vec::with_capacity((control.len() - 33) / 32);
+                                for i in (33..control.len()).step_by(32) {
+                                    let mut h = [0u8; 32];
+                                    h.copy_from_slice(&control[i..i + 32]);
+                                    path.push(h);
+                                }
+                                let version = control[0] & 254;
+                                let leaf = RevealedLeaf {
+                                    version,
+                                    script: script.to_vec(),
+                                    path,
+                                };
+                                for lh in leaf_hashes(&leaf) {
+                                    *local_h32.entry(lh).or_insert(0) |= 2 | 4;
+                                }
+                                let version = control[0] & 254;
+                                for (_, d) in Instructions::new(script) {
+                                    if let Some(data) = d {
+                                        if data.len() == 33 || data.len() == 65 {
+                                            if let Some(x) = key_x(data, false) {
+                                                *local_x.entry(x).or_insert(0) |= 1 | 2 | 32;
+                                            }
+                                        }
+                                    }
+                                }
+                                if version == 192 {
+                                    let ops: Vec<(u8, Option<&[u8]>)> =
+                                        Instructions::new(script).collect();
+                                    for w in ops.windows(2) {
+                                        if let Some(data) = w[0].1 {
+                                            if matches!(w[1].0, 172 | 173 | 186) && data.len() == 32 {
+                                                if let Some(x) = key_x(data, true) {
+                                                    *local_x.entry(x).or_insert(0) |= 1 | 2 | 32;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !is_p2tr_script && !last_w.is_empty() {
+                        let wsha = sha256(last_w);
+                        *local_h32.entry(wsha).or_insert(0) |= 2;
+                        let sh_direct = hash160(last_w);
+                        *local_h20.entry(sh_direct).or_insert(0) |= 8 | 16;
+                        let mut ww = [0u8; 34];
+                        ww[0] = 0x00;
+                        ww[1] = 0x20;
+                        ww[2..34].copy_from_slice(&wsha);
+                        *local_h20.entry(hash160(&ww)).or_insert(0) |= 8 | 16;
+                        for (_, d) in Instructions::new(last_w) {
+                            if let Some(data) = d {
+                                record_x(&mut local_x, data, false, 1 | 2 | 32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(BlockExtract { x: local_x, h20: local_h20, h32: local_h32, transactions: ntx })
+}
+
+fn flush_scan_map<const N: usize>(map: &mut FxHashMap<[u8; N], u8>,
+    shards: &[Mutex<ScanWriter>], shift: u8) -> Result<(), String> {
+    let mut buckets: Vec<Vec<u8>> = (0..shards.len()).map(|_| Vec::new()).collect();
+    for (key, mask) in map.drain() {
+        let bucket = &mut buckets[(key[0] >> shift) as usize];
+        bucket.extend_from_slice(&key);
+        bucket.push(mask);
+    }
+    for (i, bytes) in buckets.into_iter().enumerate() {
+        if !bytes.is_empty() {
+            shards[i].lock().map_err(|_| format!("scan shard {}: poisoned writer", i))?.write_all(&bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn make_scan_shards(dir: &Path, prefix: &str, count: usize) -> Result<Vec<Mutex<ScanWriter>>, String> {
+    (0..count).map(|i| ScanWriter::new(dir.join(format!("{}_{:02}.bin", prefix, i))).map(Mutex::new)).collect()
+}
+
+fn finish_scan_shards(shards: Vec<Mutex<ScanWriter>>) -> Result<(), String> {
+    for (i, shard) in shards.into_iter().enumerate() {
+        shard.into_inner().map_err(|_| format!("scan shard {}: poisoned writer", i))?.finish(None)?;
+    }
+    Ok(())
+}
+
+fn missing_directory_levels(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut missing = Vec::new();
+    for level in path.ancestors() {
+        if level.as_os_str().is_empty() { break; }
+        match fs::symlink_metadata(level) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(level.to_path_buf()),
+            Err(e) => return Err(format!("{}: metadata: {}", level.display(), e)),
+            Ok(_) => break,
+        }
+    }
+    missing.reverse();
+    Ok(missing)
+}
+
+fn withdraw_failed_checkpoint(path: &Path, error: String) -> String {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => error,
+        Err(e) => format!("{}; {} may remain in the output directory and must not be used: metadata: {}",
+            error, path.display(), e),
+        Ok(_) => match fs::remove_file(path) {
+            Ok(()) => match sync_parent(path) {
+                Ok(()) => format!("{}; {}: removed", error, path.display()),
+                Err(e) => format!("{}; {}: removed but the directory sync failed: {}", error, path.display(), e),
+            },
+            Err(e) => format!("{}; {} remains in the output directory and must not be used: remove: {}",
+                error, path.display(), e),
+        },
+    }
+}
+
+fn scan_blocks_dir(blocks_dir: &str, out_dir: &str, chain_list: &str) -> Result<usize, String> {
+    if out_dir.is_empty() { return Err("output directory path must not be empty".to_string()); }
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let t0 = Instant::now();
+    let chain = parse_chain_list(&fs::read(chain_list)
+        .map_err(|e| format!("{}: read: {}", chain_list, e))?)
+        .map_err(|e| format!("{}: {}", chain_list, e))?;
+    let height = (chain.len() - 1) as u64;
+    let block_hash = display_hash(&chain[chain.len() - 1]);
+    let by_hash: FxHashMap<[u8; 32], usize> = chain.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+    let out_path = Path::new(out_dir);
+    match fs::read_dir(out_path) {
+        Ok(mut entries) => if let Some(entry) = entries.next() {
+            entry.map_err(|e| format!("{}: directory entry: {}", out_path.display(), e))?;
+            return Err(format!("{}: output directory must be absent or empty", out_path.display()));
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("{}: read output directory: {}", out_path.display(), e)),
+    }
+    let xor_path = Path::new(blocks_dir).join("xor.dat");
+    match fs::read(&xor_path) {
+        Ok(bytes) if bytes.iter().any(|&b| b != 0) => return Err(format!("{}: obfuscated block files are not supported", xor_path.display())),
+        Ok(_) => {},
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("{}: read: {}", xor_path.display(), e)),
+    }
+    let mut blk_files = Vec::new();
+    for entry in fs::read_dir(blocks_dir).map_err(|e| format!("{}: read directory: {}", blocks_dir, e))? {
+        let path = entry.map_err(|e| format!("{}: directory entry: {}", blocks_dir, e))?.path();
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with("blk") && s.ends_with(".dat")) {
+            blk_files.push(path);
+        }
+    }
+    blk_files.sort();
+    let shard_dir = out_path.join("shards");
+    let state_dir = out_path.join("state");
+    let missing_dirs = missing_directory_levels(&shard_dir)?;
+    fs::create_dir_all(&shard_dir).map_err(|e| format!("{}: create: {}", shard_dir.display(), e))?;
+    for dir in missing_dirs { sync_parent(&dir)?; }
+    fs::create_dir(&state_dir).map_err(|e| format!("{}: create: {}", state_dir.display(), e))?;
+    sync_parent(&state_dir)?;
+    let mut manifest = std::collections::BTreeMap::new();
+    println!("[1/4] Found {} blk*.dat files in {}.", blk_files.len(), blocks_dir);
+    let x_shards = make_scan_shards(&shard_dir, "x", 64)?;
+    let h20_shards = make_scan_shards(&shard_dir, "h20", 64)?;
+    let h32_shards = make_scan_shards(&shard_dir, "h32", 16)?;
+    let seen: Vec<_> = (0..chain.len()).map(|_| AtomicBool::new(false)).collect();
+    let stopped = AtomicBool::new(false);
+    let total_blocks = AtomicUsize::new(0);
+    let total_txs = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let files_done = AtomicUsize::new(0);
+    let io_pool = rayon::ThreadPoolBuilder::new().num_threads(6).build()
+        .map_err(|e| format!("scan worker pool: {}", e))?;
+    io_pool.install(|| blk_files.par_iter().try_for_each(|path| -> Result<(), String> {
+        let result = (|| -> Result<(), String> {
+            if stopped.load(Ordering::Relaxed) { return Ok(()); }
+            let mut file = File::open(path).map_err(|e| format!("{} byte offset 0: open: {}", path.display(), e))?;
+            let mut buf = Vec::with_capacity(135 * 1024 * 1024);
+            file.read_to_end(&mut buf).map_err(|e| format!("{} byte offset {}: read: {}", path.display(), buf.len(), e))?;
+            let mut local_x = FxHashMap::default();
+            let mut local_h20 = FxHashMap::default();
+            let mut local_h32 = FxHashMap::default();
+            let mut pos = 0;
+            while pos + 8 <= buf.len() {
+                if stopped.load(Ordering::Relaxed) { return Ok(()); }
+                if buf[pos..pos + 4] != [0xf9, 0xbe, 0xb4, 0xd9] { pos += 1; continue; }
+                let size = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
+                pos += 8;
+                if size < 80 || size > buf.len() - pos { break; }
+                let offset = pos;
+                let block = &buf[pos..pos + size];
+                pos += size;
+                let hash = double_sha256(&block[..80]);
+                let Some(&h) = by_hash.get(&hash) else { skipped.fetch_add(1, Ordering::Relaxed); continue; };
+                if seen[h].swap(true, Ordering::Relaxed) {
+                    return Err(format!("{} byte offset {}: duplicate block height {} hash {}", path.display(), offset, h, display_hash(&hash)));
+                }
+                let prev = if h == 0 { &[0; 32] } else { &chain[h - 1] };
+                let extracted = extract_block(block, h as u64, &chain[h], prev)
+                    .map_err(|e| format!("{} record byte offset {}: {}", path.display(), offset, e))?;
+                for (k, m) in extracted.x { *local_x.entry(k).or_insert(0) |= m; }
+                for (k, m) in extracted.h20 { *local_h20.entry(k).or_insert(0) |= m; }
+                for (k, m) in extracted.h32 { *local_h32.entry(k).or_insert(0) |= m; }
+                total_blocks.fetch_add(1, Ordering::Relaxed);
+                total_txs.fetch_add(extracted.transactions, Ordering::Relaxed);
+                if local_x.len() + local_h20.len() + local_h32.len() >= 1_500_000 {
+                    flush_scan_map(&mut local_x, &x_shards, 2)?;
+                    flush_scan_map(&mut local_h20, &h20_shards, 2)?;
+                    flush_scan_map(&mut local_h32, &h32_shards, 4)?;
+                }
+            }
+            flush_scan_map(&mut local_x, &x_shards, 2)?;
+            flush_scan_map(&mut local_h20, &h20_shards, 2)?;
+            flush_scan_map(&mut local_h32, &h32_shards, 4)?;
+            let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 250 == 0 || done == blk_files.len() {
+                println!("  -> [1/4] Scanned {} / {} blk files ({:.1}%) in {:.1}s",
+                    done, blk_files.len(), done as f64 * 100.0 / blk_files.len() as f64, t0.elapsed().as_secs_f64());
+            }
+            Ok(())
+        })();
+        if result.is_err() { stopped.store(true, Ordering::Relaxed); }
+        result
+    }))?;
+    let missing: Vec<_> = seen.iter().enumerate().filter_map(|(h, s)| (!s.load(Ordering::Relaxed)).then_some(h)).collect();
+    if !missing.is_empty() {
+        return Err(format!("{}: {} listed blocks missing; first heights {:?}", blocks_dir, missing.len(), &missing[..missing.len().min(10)]));
+    }
+    finish_scan_shards(x_shards)?;
+    finish_scan_shards(h20_shards)?;
+    finish_scan_shards(h32_shards)?;
+    println!("[1.5/4] Block scan finished in {:.1}s ({} blocks, {} txs).",
+        t0.elapsed().as_secs_f64(), total_blocks.load(Ordering::Relaxed), total_txs.load(Ordering::Relaxed));
+    println!("  -> Skipped {} records not in chain list.", skipped.load(Ordering::Relaxed));
     // Step 1B: Reduce h32_00..15.bin immediately to free 33 GB SSD space
     let mut census = Census::default();
-    if have_done_h32 {
-        census.funded_hash32_p2wsh_note = Some("Unavailable: H32 reduction skipped on resume.");
-    } else {
-        census.funded_hash32_p2wsh = Some(0);
-    }
+    census.funded_hash32_p2wsh = Some(0);
+    let mut f32_state = ScanWriter::new(state_dir.join("f32.bin"))?;
+    let mut r32_state = ScanWriter::new(state_dir.join("r32.bin"))?;
     let mut total_wsh32 = 0usize;
     let mut total_cross_diff_32 = 0usize;
-    if !have_done_h32 {
+    {
         println!("[2a/4] Reducing 16 H32 shards into script_hash_index_32.bin & cross_format_diff_32.bin...");
         let _ = io::stdout().flush();
         let mut script32_file =
-            BufWriter::with_capacity(256 * 1024, File::create(out_path.join("script_hash_index_32.bin")).unwrap());
+            ScanWriter::new(out_path.join("script_hash_index_32.bin"))?;
         let mut cross32_file =
-            BufWriter::with_capacity(256 * 1024, File::create(out_path.join("cross_format_diff_32.bin")).unwrap());
+            ScanWriter::new(out_path.join("cross_format_diff_32.bin"))?;
         for s in 0..16 {
             let h32_path = shard_dir.join(format!("h32_{:02}.bin", s));
-            let raw_h32 = fs::read(&h32_path).unwrap_or_default();
-            let _ = fs::remove_file(&h32_path);
+            let raw_h32 = read_scan_shard(&h32_path, 33)?;
             let mut items: Vec<([u8; 32], u8)> = Vec::with_capacity(raw_h32.len() / 33);
             for chunk in raw_h32.chunks_exact(33) {
                 let mut h = [0u8; 32];
@@ -1896,38 +2110,40 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
                 deduped.push((h, m));
             }
             for (h, m) in deduped {
+                if m & 1 != 0 { f32_state.record(&h, &[])?; }
+                if m & 6 != 0 { r32_state.record(&h, &[m & 6])?; }
                 if (m & 1) != 0 {
-                    *census.funded_hash32_p2wsh.as_mut().unwrap() += 1;
+                    if let Some(count) = &mut census.funded_hash32_p2wsh { *count += 1; }
                 }
                 if (m & 1) != 0 && (m & 2) != 0 {
-                    script32_file.write_all(&h).unwrap();
+                    script32_file.write_all(&h)?;
                     total_wsh32 += 1;
                 }
                 if (m & 1) != 0 && (m & 4) != 0 {
-                    cross32_file.write_all(&h).unwrap();
+                    cross32_file.write_all(&h)?;
                     total_cross_diff_32 += 1;
                 }
             }
         }
-        script32_file.flush().unwrap();
-        cross32_file.flush().unwrap();
-    } else {
-        total_wsh32 = out_path.join("script_hash_index_32.bin").metadata().map(|m| (m.len() / 32) as usize).unwrap_or(0);
-        total_cross_diff_32 = out_path.join("cross_format_diff_32.bin").metadata().map(|m| (m.len() / 32) as usize).unwrap_or(0);
+        finish_scan_output(script32_file, &mut manifest, "script_hash_index_32.bin", Some(32))?;
+        finish_scan_output(cross32_file, &mut manifest, "cross_format_diff_32.bin", Some(32))?;
     }
+    finish_scan_output(f32_state, &mut manifest, "state/f32.bin", Some(32))?;
+    finish_scan_output(r32_state, &mut manifest, "state/r32.bin", Some(33))?;
 
     // Step 1C: Deduplicate h20_00..63.bin into funded_00..63.bin (freeing ~56 GB SSD space) and populate 2.0 GiB FundedBloom
     println!("[2b/4] Deduplicating 64 H20 shards and building 2.0 GiB FundedBloom filter...");
     let _ = io::stdout().flush();
     let bloom = FundedBloom::new();
     let mut total_sh20 = 0usize;
-    if !have_funded {
+    let mut f20_state = ScanWriter::new(state_dir.join("f20.bin"))?;
+    let mut r20_state = ScanWriter::new(state_dir.join("r20.bin"))?;
+    {
         let mut script20_idx_file =
-            BufWriter::with_capacity(256 * 1024, File::create(out_path.join("script_hash_index_20.bin")).unwrap());
+            ScanWriter::new(out_path.join("script_hash_index_20.bin"))?;
         for s in 0..64 {
             let h20_path = shard_dir.join(format!("h20_{:02}.bin", s));
-            let raw_h20 = fs::read(&h20_path).unwrap_or_default();
-            let _ = fs::remove_file(&h20_path);
+            let raw_h20 = read_scan_shard(&h20_path, 21)?;
 
             let mut h20_items: Vec<([u8; 20], u8)> = Vec::with_capacity(raw_h20.len() / 21);
             for chunk in raw_h20.chunks_exact(21) {
@@ -1948,55 +2164,42 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
                 }
                 funded_shard.push((h, m));
             }
+            for &(h, m) in &funded_shard {
+                if m & 7 != 0 { f20_state.record(&h, &[m & 7])?; }
+                if m & 24 != 0 { r20_state.record(&h, &[m & 24])?; }
+            }
             funded_shard.retain(|&(_, m)| (m & 7) != 0);
 
             let funded_path = shard_dir.join(format!("funded_{:02}.bin", s));
-            let mut ff = BufWriter::with_capacity(256 * 1024, File::create(&funded_path).unwrap());
+            let mut ff = ScanWriter::new(funded_path.clone())?;
             for &(h, m) in &funded_shard {
                 census.record_hash20(m);
                 bloom.insert(&h);
                 if (m & 4) != 0 && (m & 8) != 0 {
-                    script20_idx_file.write_all(&h).unwrap();
+                    script20_idx_file.write_all(&h)?;
                     total_sh20 += 1;
                 }
-                ff.write_all(&h).unwrap();
-                ff.write_all(&[m]).unwrap();
+                ff.write_all(&h)?;
+                ff.write_all(&[m])?;
             }
-            ff.flush().unwrap();
+            ff.finish(Some(21))?;
         }
-        script20_idx_file.flush().unwrap();
-    } else {
-        total_sh20 = out_path.join("script_hash_index_20.bin").metadata().map(|m| (m.len() / 20) as usize).unwrap_or(0);
-        for s in 0..64 {
-            let funded_path = shard_dir.join(format!("funded_{:02}.bin", s));
-            let raw_f = fs::read(&funded_path).unwrap_or_default();
-            for chunk in raw_f.chunks_exact(21) {
-                let mut h = [0u8; 20];
-                h.copy_from_slice(&chunk[0..20]);
-                census.record_hash20(chunk[20]);
-                bloom.insert(&h);
-            }
-        }
+        finish_scan_output(script20_idx_file, &mut manifest, "script_hash_index_20.bin", Some(20))?;
     }
+    finish_scan_output(f20_state, &mut manifest, "state/f20.bin", Some(21))?;
+    finish_scan_output(r20_state, &mut manifest, "state/r20.bin", Some(21))?;
 
     // Step 2: Deduplicate x_00..x_63 and emit Bloom-filtered candidate 20-byte hashes into cand_00..cand_63 (~20 GB total)
     println!("[2c/4] Deriving 6 encodings across 64 X shards with FundedBloom filtering...");
     let _ = io::stdout().flush();
     let t1 = Instant::now();
-    let cand_shards: Vec<Mutex<BufWriter<File>>> = (0..64)
-        .map(|i| {
-            Mutex::new(BufWriter::with_capacity(
-                256 * 1024,
-                File::create(shard_dir.join(format!("cand_{:02}.bin", i))).unwrap(),
-            ))
-        })
-        .collect();
+    let cand_shards = make_scan_shards(&shard_dir, "cand", 64)?;
+    let mut x_state = ScanWriter::new(state_dir.join("x.bin"))?;
 
     let mut x_flags_vec: Vec<u8> = Vec::with_capacity(700_000_000);
     for s in 0..64 {
         let x_path = shard_dir.join(format!("x_{:02}.bin", s));
-        let raw = fs::read(&x_path).unwrap_or_default();
-        let _ = fs::remove_file(&x_path);
+        let raw = read_scan_shard(&x_path, 33)?;
         let n = raw.len() / 33;
         if n == 0 {
             continue;
@@ -2022,11 +2225,12 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
         }
 
         let base_id = x_flags_vec.len() as u32;
-        for &(_, fl) in &deduped {
+        for &(x, fl) in &deduped {
+            x_state.record(&x, &[fl])?;
             x_flags_vec.push(fl);
         }
 
-        deduped.par_chunks(32768).enumerate().for_each(|(c_idx, chunk)| {
+        deduped.par_chunks(32768).enumerate().try_for_each(|(c_idx, chunk)| -> Result<(), String> {
             let chunk_base = base_id + (c_idx * 32768) as u32;
             let mut buckets: Vec<Vec<u8>> = (0..64).map(|_| Vec::new()).collect();
             for (offset, (x, _)) in chunk.iter().enumerate() {
@@ -2054,19 +2258,24 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
             }
             for (i, buf) in buckets.into_iter().enumerate() {
                 if !buf.is_empty() {
-                    cand_shards[i].lock().unwrap().write_all(&buf).unwrap();
+                    cand_shards[i].lock().map_err(|_| format!("candidate shard {}: poisoned writer", i))?.write_all(&buf)?;
                 }
             }
-        });
+            Ok(())
+        })?;
         if (s + 1) % 8 == 0 || s == 63 {
             println!("  -> [2c/4] Processed X shard {} / 64 in {:.1}s", s + 1, t1.elapsed().as_secs_f64());
             let _ = io::stdout().flush();
         }
     }
-    drop(cand_shards);
+    finish_scan_shards(cand_shards)?;
     drop(bloom);
 
     let total_unique_x = x_flags_vec.len();
+    if x_state.bytes / 33 != total_unique_x as u64 {
+        return Err(format!("{}: X record count differs from total_unique_x", state_dir.join("x.bin").display()));
+    }
+    finish_scan_output(x_state, &mut manifest, "state/x.bin", Some(33))?;
     println!(
         "[3/4] Derived 6 encodings for {} unique published x-coordinates in {:.1}s. Intersecting 64 H160 shards...",
         total_unique_x,
@@ -2081,15 +2290,14 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
         .collect();
 
     let mut pubkey_idx_file =
-        BufWriter::with_capacity(256 * 1024, File::create(out_path.join("pubkey_hash_index.bin")).unwrap());
+        ScanWriter::new(out_path.join("pubkey_hash_index.bin"))?;
     let mut matched_files: Vec<PathBuf> = Vec::with_capacity(64);
 
     let mut total_exposed_h160 = 0usize;
 
     for s in 0..64 {
         let funded_path = shard_dir.join(format!("funded_{:02}.bin", s));
-        let raw_f = fs::read(&funded_path).unwrap_or_default();
-        let _ = fs::remove_file(&funded_path);
+        let raw_f = read_scan_shard(&funded_path, 21)?;
 
         let mut funded_shard: Vec<([u8; 20], u8)> = Vec::with_capacity(raw_f.len() / 21);
         let mut shard_cross_sh20: Vec<[u8; 20]> = Vec::new();
@@ -2105,11 +2313,10 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
         drop(raw_f);
 
         let cand_path = shard_dir.join(format!("cand_{:02}.bin", s));
-        let raw_cand = fs::read(&cand_path).unwrap_or_default();
-        let _ = fs::remove_file(&cand_path);
+        let raw_cand = read_scan_shard(&cand_path, 25)?;
 
         let matched_pairs: Mutex<Vec<([u8; 20], u32)>> = Mutex::new(Vec::new());
-        raw_cand.par_chunks(25 * 32768).for_each(|chunk| {
+        raw_cand.par_chunks(25 * 32768).try_for_each(|chunk| -> Result<(), String> {
             let mut local_matches: Vec<([u8; 20], u32)> = Vec::new();
             for rec in chunk.chunks_exact(25) {
                 let mut h = [0u8; 20];
@@ -2118,7 +2325,7 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
                     continue;
                 };
                 let mask = funded_shard[pos].1;
-                let x_id = u32::from_le_bytes(rec[20..24].try_into().unwrap());
+                let x_id = u32::from_le_bytes([rec[20], rec[21], rec[22], rec[23]]);
                 let slot = rec[24];
                 let enc_idx = (slot & 7) as u16;
                 let is_wrapped = (slot & 8) != 0;
@@ -2141,20 +2348,21 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
                 }
             }
             if !local_matches.is_empty() {
-                matched_pairs.lock().unwrap().extend(local_matches);
+                matched_pairs.lock().map_err(|_| format!("{}: poisoned match collector", cand_path.display()))?.extend(local_matches);
             }
-        });
+            Ok(())
+        })?;
         drop(raw_cand);
         drop(funded_shard);
 
-        let mut pairs = matched_pairs.into_inner().unwrap();
+        let mut pairs = matched_pairs.into_inner().map_err(|_| format!("{}: poisoned match collector", cand_path.display()))?;
         pairs.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         pairs.dedup();
 
         let mut last_written: Option<[u8; 20]> = None;
         for &(h, _) in &pairs {
             if last_written != Some(h) {
-                pubkey_idx_file.write_all(&h).unwrap();
+                pubkey_idx_file.write_all(&h)?;
                 total_exposed_h160 += 1;
                 last_written = Some(h);
             }
@@ -2162,34 +2370,33 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
 
         let m_path = shard_dir.join(format!("matched_{:02}.bin", s));
         {
-            let mut mf = BufWriter::with_capacity(128 * 1024, File::create(&m_path).unwrap());
+            let mut mf = ScanWriter::new(m_path.clone())?;
             for &(h, x_id) in &pairs {
-                mf.write_all(&h).unwrap();
-                mf.write_all(&x_id.to_le_bytes()).unwrap();
+                mf.write_all(&h)?;
+                mf.write_all(&x_id.to_le_bytes())?;
             }
             for h in shard_cross_sh20 {
-                mf.write_all(&h).unwrap();
-                mf.write_all(&u32::MAX.to_le_bytes()).unwrap();
+                mf.write_all(&h)?;
+                mf.write_all(&u32::MAX.to_le_bytes())?;
             }
+            mf.finish(Some(24))?;
         }
         matched_files.push(m_path);
     }
-    pubkey_idx_file.flush().unwrap();
-    drop(pubkey_idx_file);
+    finish_scan_output(pubkey_idx_file, &mut manifest, "pubkey_hash_index.bin", Some(20))?;
 
     // Step 4: Write cross_format_diff_20.bin and stats.json
     let mut cross20_file =
-        BufWriter::with_capacity(256 * 1024, File::create(out_path.join("cross_format_diff_20.bin")).unwrap());
+        ScanWriter::new(out_path.join("cross_format_diff_20.bin"))?;
     let mut total_cross_diff_20 = 0usize;
 
     for m_path in matched_files {
-        let raw_m = fs::read(&m_path).unwrap_or_default();
-        let _ = fs::remove_file(&m_path);
+        let raw_m = read_scan_shard(&m_path, 24)?;
         let mut diff_hashes: Vec<[u8; 20]> = Vec::new();
         for rec in raw_m.chunks_exact(24) {
             let mut h = [0u8; 20];
             h.copy_from_slice(&rec[0..20]);
-            let x_id = u32::from_le_bytes(rec[20..24].try_into().unwrap());
+            let x_id = u32::from_le_bytes([rec[20], rec[21], rec[22], rec[23]]);
             if x_id == u32::MAX {
                 diff_hashes.push(h);
             } else {
@@ -2203,13 +2410,13 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
         diff_hashes.par_sort_unstable();
         diff_hashes.dedup();
         for h in diff_hashes {
-            cross20_file.write_all(&h).unwrap();
+            cross20_file.write_all(&h)?;
             total_cross_diff_20 += 1;
         }
     }
-    cross20_file.flush().unwrap();
-    drop(cross20_file);
-    let _ = fs::remove_dir_all(&shard_dir);
+    finish_scan_output(cross20_file, &mut manifest, "cross_format_diff_20.bin", Some(20))?;
+    fs::remove_dir_all(&shard_dir).map_err(|e| format!("{}: remove directory: {}", shard_dir.display(), e))?;
+    sync_parent(&shard_dir)?;
 
     let mut c_p2pk_p2pkh = 0usize;
     let mut c_pkh_wpkh = 0usize;
@@ -2230,6 +2437,8 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
     }
 
     let stats_json = serde_json::json!({
+        "scan_height": height,
+        "scan_block_hash": block_hash,
         "census": census,
         "unique_published_x_coords": total_unique_x,
         "exposed_h160_entries": total_exposed_h160,
@@ -2243,30 +2452,53 @@ fn scan_blocks_dir(blocks_dir: &str, out_dir: &str) {
             "keys_in_both_compressed_and_uncompressed": c_comp_uncomp
         }
     });
-    fs::write(
-        out_path.join("stats.json"),
-        serde_json::to_string_pretty(&stats_json).unwrap(),
-    )
-    .unwrap();
+    write_scan_output(out_path, &mut manifest, "stats.json",
+        &serde_json::to_vec_pretty(&stats_json).map_err(|e| format!("stats.json: serialize: {}", e))?)?;
+    write_scan_output(out_path, &mut manifest, "last_indexed_height", format!("{}\n", height).as_bytes())?;
+    let mut file_hashes = [[0; 32]; 8];
+    for (i, name) in DIGEST_FILES.iter().enumerate() {
+        let info = manifest.get(*name).ok_or_else(|| format!("checkpoint: missing {}", name))?;
+        hex::decode_to_slice(&info.sha256, &mut file_hashes[i])
+            .map_err(|e| format!("checkpoint {}: invalid digest: {}", name, e))?;
+    }
+    let mut tip_display = chain[chain.len() - 1];
+    tip_display.reverse();
+    let checkpoint = serde_json::json!({
+        "format": "btc-indexer-checkpoint/1", "height": height, "block_hash": block_hash,
+        "rules_version": RULES_VERSION, "files": manifest,
+        "state_digest": hex::encode(state_digest(RULES_VERSION, height, &tip_display, &file_hashes)?),
+    });
+    let mut checkpoint_file = ScanWriter::new(out_path.join("checkpoint.json"))?;
+    checkpoint_file.write_all(&serde_json::to_vec_pretty(&checkpoint)
+        .map_err(|e| format!("checkpoint.json: serialize: {}", e))?)?;
+    // checkpoint.json is written last, after all other output files are written, synced and renamed
+    // and their directories synced; it records each file's size and SHA-256. A scan is complete only
+    // if the process exits with status 0. Removing checkpoint.json after failed publication is best
+    // effort: removal can fail, or the process can stop before it runs. Callers must not use the
+    // output directory of a run that did not exit with status 0.
+    checkpoint_file.finish(None)
+        .map_err(|e| withdraw_failed_checkpoint(&out_path.join("checkpoint.json"), e))?;
 
-    println!(
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out,
         "[4/4] Index build completed in {:.1}s (total {:.1}s)!",
         t2.elapsed().as_secs_f64(),
         t0.elapsed().as_secs_f64()
     );
-    println!("  - Exposed H160 entries written: {} ({:.2} MB)", total_exposed_h160, (total_exposed_h160 * 20) as f64 / 1e6);
-    println!("  - Revealed P2SH entries written: {} ({:.2} MB)", total_sh20, (total_sh20 * 20) as f64 / 1e6);
-    println!("  - Revealed P2WSH entries written: {} ({:.2} MB)", total_wsh32, (total_wsh32 * 32) as f64 / 1e6);
-    println!("  - Minimal Cross-Format Diff 20B entries: {} ({:.2} MB)", total_cross_diff_20, (total_cross_diff_20 * 20) as f64 / 1e6);
-    println!("  - Minimal Cross-Format Diff 32B entries: {} ({:.2} MB)", total_cross_diff_32, (total_cross_diff_32 * 32) as f64 / 1e6);
-    println!("  - Cross-type reuse stats:");
-    println!("      * Keys in both P2PK and P2PKH: {}", c_p2pk_p2pkh);
-    println!("      * Keys in both P2PKH and P2WPKH: {}", c_pkh_wpkh);
-    println!("      * Keys funded under both Compressed and Uncompressed encodings: {}", c_comp_uncomp);
-    println!("  - Census stats:");
-    for (name, value) in stats_json["census"].as_object().unwrap() {
-        println!("      * {}: {}", name, value);
+    let _ = writeln!(out, "  - Exposed H160 entries written: {} ({:.2} MB)", total_exposed_h160, (total_exposed_h160 * 20) as f64 / 1e6);
+    let _ = writeln!(out, "  - Revealed P2SH entries written: {} ({:.2} MB)", total_sh20, (total_sh20 * 20) as f64 / 1e6);
+    let _ = writeln!(out, "  - Revealed P2WSH entries written: {} ({:.2} MB)", total_wsh32, (total_wsh32 * 32) as f64 / 1e6);
+    let _ = writeln!(out, "  - Minimal Cross-Format Diff 20B entries: {} ({:.2} MB)", total_cross_diff_20, (total_cross_diff_20 * 20) as f64 / 1e6);
+    let _ = writeln!(out, "  - Minimal Cross-Format Diff 32B entries: {} ({:.2} MB)", total_cross_diff_32, (total_cross_diff_32 * 32) as f64 / 1e6);
+    let _ = writeln!(out, "  - Cross-type reuse stats:");
+    let _ = writeln!(out, "      * Keys in both P2PK and P2PKH: {}", c_p2pk_p2pkh);
+    let _ = writeln!(out, "      * Keys in both P2PKH and P2WPKH: {}", c_pkh_wpkh);
+    let _ = writeln!(out, "      * Keys funded under both Compressed and Uncompressed encodings: {}", c_comp_uncomp);
+    let _ = writeln!(out, "  - Census stats:");
+    if let Some(rows) = stats_json["census"].as_object() {
+        for (name, value) in rows { let _ = writeln!(out, "      * {}: {}", name, value); }
     }
+    Ok(skipped.load(Ordering::Relaxed))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3477,8 +3709,19 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() >= 3 && args[1] == "--self-test" {
         run_self_test(&args[2]);
-    } else if args.len() >= 4 && args[1] == "--scan-blocks" {
-        scan_blocks_dir(&args[2], &args[3]);
+    } else if args.len() == 5 && args[1] == "--scan-blocks" {
+        if let Err(e) = scan_blocks_dir(&args[2], &args[3], &args[4]) {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
+    } else if args.len() == 6 && args[1] == "--export-chain-list" {
+        let result = args[4].parse::<u64>()
+            .map_err(|e| format!("height argument {:?}: {}", args[4], e))
+            .and_then(|h| export_chain_list(&args[2], Path::new(&args[3]), h, Path::new(&args[5])));
+        if let Err(e) = result {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
     } else if args.len() >= 5 && args[1] == "--apply-block-hex" {
         let result = args[3].parse::<u64>()
             .map_err(|e| format!("height argument {:?}: {}", args[3], e))
@@ -3499,7 +3742,8 @@ fn main() {
     } else {
         eprintln!("Usage:");
         eprintln!("  btc-indexer --self-test <test_vectors_070.json>");
-        eprintln!("  btc-indexer --scan-blocks <blocks_dir> <out_dir>");
+        eprintln!("  btc-indexer --scan-blocks <blocks_dir> <out_dir> <chain_list>");
+        eprintln!("  btc-indexer --export-chain-list <rpc_url> <cookie_file> <height> <out_file>");
         eprintln!("  btc-indexer --apply-block-hex <index_dir> <height> <block_hash>");
         eprintln!("  btc-indexer --compact <index_dir>");
         eprintln!("  btc-indexer --query <index_dir> <script_pubkey_hex>");
@@ -3740,6 +3984,7 @@ mod integrity_tests {
         script_sig: Vec<u8>,
         outputs: Vec<Vec<u8>>,
         witness: Vec<Vec<u8>>,
+        lock_time: u32,
     }
     fn put_count(out: &mut Vec<u8>, n: usize) {
         match n {
@@ -3773,7 +4018,7 @@ mod integrity_tests {
                     bytes.extend_from_slice(item);
                 }
             }
-            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&self.lock_time.to_le_bytes());
             bytes
         }
     }
@@ -3786,8 +4031,8 @@ mod integrity_tests {
     }
     fn fixture() -> Vec<TestTx> {
         let spend = TestTx { coinbase: false, script_sig: vec![], outputs: vec![vec![0x51]],
-            witness: vec![vec![0x31; 253], vec![0x51]] };
-        let legacy = TestTx { coinbase: false, script_sig: vec![1, 7], outputs: vec![vec![0x51]], witness: vec![] };
+            witness: vec![vec![0x31; 253], vec![0x51]], lock_time: 0 };
+        let legacy = TestTx { coinbase: false, script_sig: vec![1, 7], outputs: vec![vec![0x51]], witness: vec![], lock_time: 0 };
         let root = test_root(vec![[0; 32], double_sha256(&spend.serialize(true)), double_sha256(&legacy.serialize(true))]);
         let reserved = vec![0x42; 32];
         let commitment = double_sha256(&[root.as_slice(), &reserved].concat());
@@ -3795,7 +4040,7 @@ mod integrity_tests {
         let coinbase = TestTx { coinbase: true, script_sig: vec![1, 1],
             // The higher matching output wins, and bytes after the commitment are allowed.
             outputs: vec![[prefix.as_slice(), &[0; 32]].concat(), vec![0x51],
-                [prefix.as_slice(), commitment.as_slice(), &[0x99]].concat()], witness: vec![reserved] };
+                [prefix.as_slice(), commitment.as_slice(), &[0x99]].concat()], witness: vec![reserved], lock_time: 0 };
         vec![coinbase, spend, legacy]
     }
     fn block_bytes(txs: &[TestTx], full: bool) -> Vec<u8> {
@@ -4006,6 +4251,888 @@ mod integrity_tests {
         }
         Ok(())
     }
+    mod chain_scan {
+        use super::*;
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        fn push(data: &[u8]) -> Vec<u8> {
+            let mut out = if data.len() <= 75 { vec![data.len() as u8] }
+                else { vec![0x4c, data.len() as u8] };
+            out.extend_from_slice(data);
+            out
+        }
+        fn p2sh(script: &[u8]) -> Vec<u8> { [vec![0xa9, 20], hash160(script).to_vec(), vec![0x87]].concat() }
+        fn p2wsh(script: &[u8]) -> Vec<u8> { [vec![0, 32], sha256(script).to_vec()].concat() }
+
+        fn branch_transactions(height: u32) -> Result<Vec<TestTx>, String> {
+            let key = hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .map_err(|e| e.to_string())?;
+            let pk = PublicKey::from_slice(&key).map_err(|e| e.to_string())?;
+            let uncompressed = pk.serialize_uncompressed().to_vec();
+            let mut hybrid = uncompressed.clone();
+            hybrid[0] = 6 + (hybrid[64] & 1);
+            let mut odd_key = key.clone();
+            odd_key[0] = 3;
+            let mut odd_hybrid = PublicKey::from_slice(&odd_key).map_err(|e| e.to_string())?
+                .serialize_uncompressed().to_vec();
+            odd_hybrid[0] = 7;
+            let mut invalid = vec![2];
+            invalid.extend_from_slice(&[0xff; 32]);
+            let multisig = [vec![0x52], push(&key), push(&uncompressed), vec![0x52, 0xae]].concat();
+            let p2pk = [push(&key), vec![0xac]].concat();
+            let wpkh = [vec![0, 20], hash160(&key).to_vec()].concat();
+            let tapscript = [push(&key[1..]), vec![0xac], push(&key[1..]), vec![0xba],
+                push(&hybrid), push(&invalid)].concat();
+            let mut control = vec![0xc0];
+            control.extend_from_slice(&key[1..]);
+            let control2 = [control.clone(), vec![0x19; 64]].concat();
+            let mut future_control = control.clone();
+            future_control[0] = 0xc2;
+            let bad_control = [vec![0xc0], vec![0xff; 32]].concat();
+            let sig = vec![0x30; 64];
+            let annex = vec![0x50, 0x01];
+            let mut outputs = vec![
+                [vec![0x76, 0xa9, 20], hash160(&key).to_vec(), vec![0x88, 0xac]].concat(),
+                wpkh.clone(), p2sh(&wpkh), p2sh(&multisig), p2wsh(&multisig), p2sh(&p2wsh(&multisig)),
+                [vec![0x51, 32], key[1..].to_vec()].concat(), p2pk.clone(), multisig.clone(),
+                [push(&uncompressed), vec![0xac]].concat(), [push(&hybrid), vec![0xac]].concat(),
+                [push(&odd_hybrid), vec![0xac]].concat(), [vec![0x6a], push(&invalid)].concat(),
+                [vec![0x6a], push(&key)].concat(), push(&invalid),
+                p2sh(&key), p2sh(&[]), p2wsh(&key), p2wsh(&control), p2wsh(&tapscript),
+                p2sh(&tapscript), p2wsh(&p2pk), p2wsh(&[]),
+            ];
+            for path in [Vec::new(), vec![[0x19; 32]; 2]] {
+                for hash in leaf_hashes(&RevealedLeaf { version: 192, script: tapscript.clone(), path }) {
+                    outputs.push([vec![0, 32], hash.to_vec()].concat());
+                }
+            }
+            let cases = vec![
+                ([push(&sig), push(&key)].concat(), vec![]),
+                (vec![], vec![sig.clone(), key.clone()]),
+                (push(&wpkh), vec![sig.clone(), key.clone()]),
+                ([vec![0], push(&sig), push(&sig), push(&multisig)].concat(), vec![]),
+                (vec![], vec![vec![], sig.clone(), sig.clone(), multisig.clone()]),
+                (push(&p2wsh(&multisig)), vec![vec![], sig.clone(), sig.clone(), multisig]),
+                (vec![], vec![sig.clone()]),
+                (vec![], vec![sig.clone(), annex.clone()]),
+                (vec![], vec![sig.clone(), tapscript.clone(), control.clone()]),
+                (vec![], vec![sig.clone(), tapscript.clone(), control, annex.clone()]),
+                (vec![], vec![sig.clone(), tapscript.clone(), control2.clone()]),
+                (vec![], vec![sig.clone(), tapscript.clone(), control2, annex]),
+                (push(&sig), vec![]),
+                (push(&key), vec![]),
+                (vec![0], vec![]),
+                (vec![], vec![sig.clone(), key]),
+                (vec![], vec![sig.clone(), tapscript.clone(), {
+                    let mut c = vec![0xc0]; c.extend_from_slice(&pk.serialize()[1..]); c
+                }]),
+                ([push(&sig), push(&uncompressed)].concat(), vec![]),
+                (vec![], vec![sig.clone(), hybrid]),
+                (push(&p2pk), vec![]),
+                (vec![], vec![sig.clone(), vec![]]),
+                (vec![], vec![sig.clone(), tapscript.clone(), future_control]),
+                (vec![], vec![sig.clone(), tapscript.clone(), bad_control]),
+            ];
+            let mut txs = vec![TestTx { coinbase: true, script_sig: push(&height.to_le_bytes()),
+                outputs: std::mem::take(&mut outputs), witness: vec![vec![0x42; 32]], lock_time: 0 }];
+            for (i, (script_sig, witness)) in cases.into_iter().enumerate() {
+                txs.push(TestTx { coinbase: false, script_sig, witness,
+                    outputs: vec![[vec![0x6a], push(&(i as u32).to_le_bytes())].concat()], lock_time: 0 });
+            }
+            let root = merkle_root(std::iter::once([0; 32])
+                .chain(txs.iter().skip(1).map(|t| double_sha256(&t.serialize(true)))).collect())?;
+            let commitment = double_sha256(&[root.as_slice(), &[0x42; 32]].concat());
+            txs[0].outputs.push([vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed], commitment.to_vec()].concat());
+            Ok(txs)
+        }
+
+        fn synthetic_chain(count: u32) -> Result<Vec<Vec<u8>>, String> {
+            let mut chain = Vec::new();
+            let mut prev = [0; 32];
+            for h in 0..count {
+                let mut block = block_bytes(&branch_transactions(h)?, true);
+                block[4..36].copy_from_slice(&prev);
+                block[68..72].copy_from_slice(&h.to_le_bytes());
+                prev = double_sha256(&block[..80]);
+                chain.push(block);
+            }
+            Ok(chain)
+        }
+        fn record(block: &[u8]) -> Vec<u8> {
+            [vec![0xf9, 0xbe, 0xb4, 0xd9], (block.len() as u32).to_le_bytes().to_vec(), block.to_vec()].concat()
+        }
+        fn write_chain(dir: &Path, chain: &[Vec<u8>]) -> TestResult {
+            fs::create_dir_all(dir.join("blocks"))?;
+            let mut list = String::new();
+            for (h, block) in chain.iter().enumerate() { list.push_str(&format!("{} {}\n", h, header_hash(block))); }
+            fs::write(dir.join("chain-list.txt"), list)?;
+            fs::write(dir.join("blocks/blk00000.dat"), chain.iter().flat_map(|b| record(b)).collect::<Vec<_>>())?;
+            Ok(())
+        }
+        fn scan(dir: &Path, name: &str) -> Result<usize, String> {
+            scan_blocks_dir(dir.join("blocks").to_str().ok_or("test blocks path")?,
+                dir.join(name).to_str().ok_or("test output path")?,
+                dir.join("chain-list.txt").to_str().ok_or("test list path")?)
+        }
+
+        struct HandCase {
+            name: &'static str,
+            tx: TestTx,
+            expected: BlockExtract,
+        }
+
+        fn hand_expected(x: &[([u8; 32], u8)], h20: &[([u8; 20], u8)],
+            h32: &[([u8; 32], u8)]) -> BlockExtract {
+            BlockExtract { x: x.iter().copied().collect(), h20: h20.iter().copied().collect(),
+                h32: h32.iter().copied().collect(), transactions: 2 }
+        }
+
+        fn hand_case(name: &'static str, script_sig: Vec<u8>, witness: Vec<Vec<u8>>,
+            outputs: Vec<Vec<u8>>, expected: BlockExtract) -> HandCase {
+            HandCase { name, tx: TestTx { coinbase: false, script_sig, outputs, witness, lock_time: 0 }, expected }
+        }
+
+        fn literal_x(text: &str) -> Result<[u8; 32], String> {
+            let mut x = [0; 32];
+            hex::decode_to_slice(text, &mut x).map_err(|e| e.to_string())?;
+            Ok(x)
+        }
+
+        fn compressed(x: &[u8; 32]) -> Vec<u8> { [vec![2], x.to_vec()].concat() }
+        fn pkh(hash: [u8; 20]) -> Vec<u8> {
+            [vec![0x76, 0xa9, 20], hash.to_vec(), vec![0x88, 0xac]].concat()
+        }
+        fn wpkh(hash: [u8; 20]) -> Vec<u8> { [vec![0, 20], hash.to_vec()].concat() }
+        fn multisig_2of3(keys: &[Vec<u8>; 3]) -> Vec<u8> {
+            [vec![0x52], push(&keys[0]), push(&keys[1]), push(&keys[2]), vec![0x53, 0xae]].concat()
+        }
+
+        // Each row lists the full mapping and numeric masks; expected values bypass extractors, recognizers, and script-role inference.
+        fn hand_cases() -> Result<Vec<HandCase>, String> {
+            let g = literal_x("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")?;
+            let g2 = literal_x("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")?;
+            let g3 = literal_x("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")?;
+            let g4 = literal_x("e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13")?;
+            let g5 = literal_x("2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4")?;
+            let g6 = literal_x("fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")?;
+            let g7 = literal_x("5cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")?;
+            let g8 = literal_x("2f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01")?;
+            let g9 = literal_x("acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe")?;
+            let g10 = literal_x("a0434d9e47f3c86235477c7b1ae6ae5d3442d49b1943c2b752a68e2a47e247c7")?;
+            let g11 = literal_x("774ae7f858a9411e5ef4246b70c65aac5649980be5c17891bbec17895da008cb")?;
+            let g12 = literal_x("d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a")?;
+            let g13 = literal_x("f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8")?;
+            let g14 = literal_x("499fdf9e895e719cfd64e67f07d38e3226aa7b63678949e6e49b241a60e823e4")?;
+            let g15 = literal_x("d7924d4f7d43ea965a465ae3095ff41131e5946f3c85f79e44adbcf8e27e080e")?;
+            let g16 = literal_x("e60fce93b59e9ec53011aabc21c23e97b2a31369b87a5ae9c44ee89e2a6dec0a")?;
+            let g17 = literal_x("defdea4cdb677750a420fee807eacf21eb9898ae79b9768766e4faa04a2d4a34")?;
+            let uncompressed = hex::decode(concat!("0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")).map_err(|e| e.to_string())?;
+            let hybrid = hex::decode(concat!("06c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+                "1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a")).map_err(|e| e.to_string())?;
+            let mut cases = vec![
+                hand_case("output P2PKH", vec![], vec![], vec![pkh([0x11; 20])],
+                    hand_expected(&[], &[([0x11; 20], 1)], &[])),
+                hand_case("output P2WPKH", vec![], vec![], vec![wpkh([0x12; 20])],
+                    hand_expected(&[], &[([0x12; 20], 2)], &[])),
+                hand_case("output P2SH", vec![], vec![], vec![[vec![0xa9, 20], vec![0x13; 20], vec![0x87]].concat()],
+                    hand_expected(&[], &[([0x13; 20], 4)], &[])),
+                hand_case("output P2WSH", vec![], vec![], vec![[vec![0, 32], vec![0x14; 32]].concat()],
+                    hand_expected(&[], &[], &[([0x14; 32], 1)])),
+                hand_case("output P2TR", vec![], vec![], vec![[vec![0x51, 32], g3.to_vec()].concat()],
+                    hand_expected(&[(g3, 11)], &[], &[])),
+                hand_case("output compressed P2PK", vec![], vec![], vec![[push(&compressed(&g4)), vec![0xac]].concat()],
+                    hand_expected(&[(g4, 55)], &[], &[])),
+                hand_case("output uncompressed P2PK", vec![], vec![], vec![[push(&uncompressed), vec![0xac]].concat()],
+                    hand_expected(&[(g, 55)], &[], &[])),
+                hand_case("output hybrid P2PK", vec![], vec![], vec![[push(&hybrid), vec![0xac]].concat()],
+                    hand_expected(&[(g2, 55)], &[], &[])),
+                hand_case("output bare 1-of-2", vec![], vec![], vec![[vec![0x51], push(&compressed(&g6)),
+                    push(&compressed(&g7)), vec![0x52, 0xae]].concat()],
+                    hand_expected(&[(g6, 51), (g7, 51)], &[], &[])),
+                hand_case("output OP_RETURN valid point", vec![], vec![], vec![[vec![0x6a], push(&compressed(&g5))].concat()],
+                    hand_expected(&[(g5, 19)], &[], &[])),
+                hand_case("output unknown witness version", vec![], vec![], vec![[vec![0x52, 32], vec![0x15; 32]].concat()],
+                    hand_expected(&[], &[], &[])),
+                hand_case("input P2PKH", [push(&[0x30; 64]), push(&compressed(&g8))].concat(), vec![], vec![],
+                    hand_expected(&[(g8, 33)], &[], &[])),
+                hand_case("input P2WPKH", vec![], vec![vec![0x31; 64], compressed(&g9)], vec![],
+                    hand_expected(&[(g9, 33)], &[], &[])),
+            ];
+            let redeem = wpkh(hash160(&compressed(&g10)));
+            let wrapped = [vec![0, 32], sha256(&redeem).to_vec()].concat();
+            cases.push(hand_case("input P2SH-P2WPKH", push(&redeem), vec![vec![0x32; 64], compressed(&g10)], vec![],
+                hand_expected(&[(g10, 33)], &[(hash160(&redeem), 8), (hash160(&wrapped), 24)], &[(sha256(&redeem), 6)])));
+
+            // Current rules skip curve validation for compressed candidates' x; the three multisig scripts use distinct candidates.
+            for (name, base, role) in [("input P2SH 2-of-3", 0x21, 0),
+                ("input P2WSH 2-of-3", 0x24, 1), ("input P2SH-P2WSH", 0x27, 2)] {
+                let xs = [[base; 32], [base + 1; 32], [base + 2; 32]];
+                let script = multisig_2of3(&xs.map(|x| compressed(&x)));
+                let wrapped = [vec![0, 32], sha256(&script).to_vec()].concat();
+                let double_wrapped = [vec![0, 32], sha256(&wrapped).to_vec()].concat();
+                let (script_sig, witness, h20, h32) = match role {
+                    0 => ([vec![0], push(&[0x33; 64]), push(&[0x34; 64]), push(&script)].concat(), vec![],
+                        vec![(hash160(&script), 8), (hash160(&wrapped), 24)], vec![(sha256(&script), 6)]),
+                    1 => (vec![], vec![vec![], vec![0x35; 64], vec![0x36; 64], script.clone()],
+                        vec![(hash160(&script), 24), (hash160(&wrapped), 24)], vec![(sha256(&script), 2)]),
+                    _ => (push(&wrapped), vec![vec![], vec![0x37; 64], vec![0x38; 64], script.clone()],
+                        vec![(hash160(&script), 24), (hash160(&wrapped), 8), (hash160(&double_wrapped), 24)],
+                        vec![(sha256(&script), 6), (sha256(&wrapped), 6)]),
+                };
+                cases.push(hand_case(name, script_sig, witness, vec![],
+                    hand_expected(&xs.map(|x| (x, 35)), &h20, &h32)));
+            }
+            for (name, signature, annex) in [("input P2TR key path", vec![0x39; 64], None),
+                ("input P2TR key path annex", vec![0x3a; 64], Some(vec![0x50, 0x3b]))] {
+                let mut witness = vec![signature.clone()];
+                if let Some(ref bytes) = annex { witness.push(bytes.clone()); }
+                // Without UTXOs, shape rules treat a signature or a full stack's trailing annex as a native witness script.
+                let script = annex.as_ref().unwrap_or(&signature);
+                let wrapped = [vec![0, 32], sha256(script).to_vec()].concat();
+                cases.push(hand_case(name, vec![], witness, vec![], hand_expected(&[],
+                    &[(hash160(script), 24), (hash160(&wrapped), 24)], &[(sha256(script), 2)])));
+            }
+
+            // Build expected TapLeaf and two-level TapBranch values directly from tagged-hash byte preimages.
+            for (name, internal, signing, second, path) in [
+                ("input P2TR script path zero", g13, g14, None, false),
+                ("input P2TR script path two", g15, g16, Some(g17), true),
+            ] {
+                let mut script = [vec![32], signing.to_vec(), vec![0xac]].concat();
+                let mut xs = vec![(internal, 35), (signing, 35)];
+                if let Some(x) = second {
+                    script.extend([vec![32], x.to_vec(), vec![0xba]].concat());
+                    xs.push((x, 35));
+                }
+                let mut control = [vec![0xc0], internal.to_vec()].concat();
+                let wrapped = [vec![0, 32], sha256(&script).to_vec()].concat();
+                let leaf = tagged_hash(b"TapLeaf", &[vec![0xc0, script.len() as u8], script.clone()].concat());
+                let mut h32 = vec![(sha256(&script), 6), (leaf, 6)];
+                if path {
+                    let a = [0x41; 32];
+                    let b = [0xe2; 32];
+                    control.extend_from_slice(&a);
+                    control.extend_from_slice(&b);
+                    let branch = tagged_hash(b"TapBranch", &if leaf < a { [leaf, a].concat() } else { [a, leaf].concat() });
+                    let root = tagged_hash(b"TapBranch", &if branch < b { [branch, b].concat() } else { [b, branch].concat() });
+                    h32.extend([(branch, 6), (root, 6)]);
+                }
+                cases.push(hand_case(name, vec![], vec![vec![0x3c; 64], script.clone(), control], vec![],
+                    hand_expected(&xs, &[(hash160(&script), 24), (hash160(&wrapped), 24)], &h32)));
+            }
+            let key_script = compressed(&[0x61; 32]);
+            cases.push(hand_case("two pushes pubkey redeem", [push(&[0x3d; 64]), push(&key_script)].concat(),
+                vec![], vec![p2sh(&key_script)], hand_expected(&[([0x61; 32], 33)], &[(hash160(&key_script), 4)], &[])));
+            cases.push(hand_case("empty redeem", [push(&[0x3e; 64]), vec![0]].concat(), vec![], vec![p2sh(&[])],
+                hand_expected(&[], &[(hash160(&[]), 4)], &[])));
+            let key_script = compressed(&[0x62; 32]);
+            cases.push(hand_case("two elements pubkey witness script", vec![], vec![vec![0x3f; 64], key_script.clone()],
+                vec![p2wsh(&key_script)], hand_expected(&[([0x62; 32], 33)], &[], &[(sha256(&key_script), 1)])));
+            let script = [vec![32], g11.to_vec(), vec![0xba]].concat();
+            let control = [vec![0xc0], g12.to_vec()].concat();
+            let wrapped = [vec![0, 32], sha256(&script).to_vec()].concat();
+            let leaf = tagged_hash(b"TapLeaf", &[vec![0xc0, 34], script.clone()].concat());
+            cases.push(hand_case("witness script looks like control", vec![],
+                vec![vec![0x40; 64], script.clone(), control.clone()], vec![p2wsh(&control)],
+                hand_expected(&[(g11, 35), (g12, 35)], &[(hash160(&script), 24), (hash160(&wrapped), 24)],
+                    &[(sha256(&control), 1), (sha256(&script), 6), (leaf, 6)])));
+            for (name, prefix, x) in [("off-curve compressed 02 push", 2, [0xff; 32]),
+                ("off-curve compressed 03 push", 3, [0; 32])] {
+                cases.push(hand_case(name, vec![], vec![], vec![push(&[vec![prefix], x.to_vec()].concat())],
+                    hand_expected(&[(x, 19)], &[], &[])));
+            }
+            Ok(cases)
+        }
+
+        fn committed_transactions(mut spends: Vec<TestTx>, height: u32) -> Vec<TestTx> {
+            let has_witness = spends.iter().any(|tx| !tx.witness.is_empty());
+            let mut coinbase = TestTx { coinbase: true, script_sig: push(&height.to_le_bytes()),
+                outputs: vec![vec![0x51]], witness: vec![], lock_time: 0 };
+            if has_witness {
+                let root = test_root(std::iter::once([0; 32])
+                    .chain(spends.iter().map(|tx| double_sha256(&tx.serialize(true)))).collect());
+                let commitment = double_sha256(&[root.as_slice(), &[0x42; 32]].concat());
+                coinbase.witness = vec![vec![0x42; 32]];
+                coinbase.outputs.push([vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed], commitment.to_vec()].concat());
+            }
+            spends.insert(0, coinbase);
+            spends
+        }
+
+        fn assert_hand_extract(block: &[u8], expected: &BlockExtract, name: &str) -> TestResult {
+            let actual = extract_block(block, 0, &double_sha256(&block[..80]), &[0; 32])?;
+            assert_eq!(actual.transactions, expected.transactions, "{} transactions", name);
+            assert_eq!(actual.x, expected.x, "{} x", name);
+            assert_eq!(actual.h20, expected.h20, "{} h20", name);
+            assert_eq!(actual.h32, expected.h32, "{} h32", name);
+            Ok(())
+        }
+
+        fn merge_hand_expected(target: &mut BlockExtract, source: BlockExtract) {
+            for (key, mask) in source.x { *target.x.entry(key).or_insert(0) |= mask; }
+            for (key, mask) in source.h20 { *target.h20.entry(key).or_insert(0) |= mask; }
+            for (key, mask) in source.h32 { *target.h32.entry(key).or_insert(0) |= mask; }
+        }
+
+        fn hand_merge_cases() -> Vec<HandCase> {
+            let mut cases = vec![
+                hand_case("merge x output push", vec![], vec![], vec![push(&compressed(&[0x63; 32]))],
+                    hand_expected(&[([0x63; 32], 19)], &[], &[])),
+                hand_case("merge x input push", push(&compressed(&[0x63; 32])), vec![], vec![],
+                    hand_expected(&[([0x63; 32], 33)],
+                        &[(hash160(&compressed(&[0x63; 32])), 8),
+                            (hash160(&[vec![0, 32], sha256(&compressed(&[0x63; 32])).to_vec()].concat()), 24)],
+                        &[(sha256(&compressed(&[0x63; 32])), 6)])),
+                hand_case("merge x P2PK", vec![], vec![], vec![[push(&compressed(&[0x63; 32])), vec![0xac]].concat()],
+                    hand_expected(&[([0x63; 32], 55)], &[], &[])),
+            ];
+            for (name, output, mask) in [("merge funded P2PKH", pkh([0x64; 20]), 1),
+                ("merge funded P2WPKH", wpkh([0x64; 20]), 2),
+                ("merge funded P2SH", [vec![0xa9, 20], vec![0x64; 20], vec![0x87]].concat(), 4)] {
+                cases.push(hand_case(name, vec![], vec![], vec![output], hand_expected(&[], &[([0x64; 20], mask)], &[])));
+            }
+            let script = vec![0x51, 0x52, 0x75];
+            let wrapped = [vec![0, 32], sha256(&script).to_vec()].concat();
+            cases.push(hand_case("merge reveal", vec![], vec![vec![0x65; 64], script.clone()], vec![],
+                hand_expected(&[], &[(hash160(&script), 24), (hash160(&wrapped), 24)], &[(sha256(&script), 2)])));
+            cases.push(hand_case("merge fund revealed forms", vec![], vec![], vec![p2sh(&script), p2wsh(&script)],
+                hand_expected(&[], &[(hash160(&script), 4)], &[(sha256(&script), 1)])));
+            cases
+        }
+
+        #[test]
+        fn extractor_hand_specified_rows_and_transaction_union() -> TestResult {
+            for case in hand_cases()?.into_iter().chain(hand_merge_cases()) {
+                let block = block_bytes(&committed_transactions(vec![case.tx], 0), true);
+                assert_hand_extract(&block, &case.expected, case.name)?;
+            }
+            let mut expected = hand_expected(&[], &[], &[]);
+            let mut txs = Vec::new();
+            let mut txids = FxHashSet::default();
+            for (i, mut case) in hand_cases()?.into_iter().chain(hand_merge_cases()).enumerate() {
+                // Witness differences do not change txid; lock time keeps transactions unique in merged blocks without affecting extraction.
+                case.tx.lock_time = u32::try_from(i + 1)?;
+                assert!(txids.insert(double_sha256(&case.tx.serialize(false))), "duplicate txid for {}", case.name);
+                merge_hand_expected(&mut expected, case.expected);
+                txs.push(case.tx);
+            }
+            assert_eq!(expected.x[&[0x63; 32]], 55);
+            assert_eq!(expected.h20[&[0x64; 20]], 7);
+            assert_eq!(expected.h20[&hash160(&[0x51, 0x52, 0x75])], 28);
+            assert_eq!(expected.h32[&sha256(&[0x51, 0x52, 0x75])], 3);
+            expected.transactions = txs.len() + 1;
+            assert_hand_extract(&block_bytes(&committed_transactions(txs, 0), true), &expected, "union")
+        }
+
+        #[test]
+        fn real_scan_persisted_state_matches_hand_specified_union() -> TestResult {
+            let temp = TempDir::new()?;
+            let mut chain = Vec::new();
+            let mut prev = [0; 32];
+            let mut expected = hand_expected(&[], &[], &[]);
+            for (height, case) in hand_cases()?.into_iter().chain(hand_merge_cases()).enumerate() {
+                let mut block = block_bytes(&committed_transactions(vec![case.tx], height as u32), true);
+                block[4..36].copy_from_slice(&prev);
+                prev = double_sha256(&block[..80]);
+                chain.push(block);
+                merge_hand_expected(&mut expected, case.expected);
+            }
+            write_chain(&temp.0, &chain)?;
+            assert_eq!(scan(&temp.0, "out")?, 0);
+            for (name, mut records) in [
+                ("x.bin", expected.x.iter().map(|(k, m)| [k.to_vec(), vec![*m]].concat()).collect::<Vec<_>>()),
+                ("f20.bin", expected.h20.iter().filter(|(_, m)| **m & 7 != 0)
+                    .map(|(k, m)| [k.to_vec(), vec![m & 7]].concat()).collect()),
+                ("r20.bin", expected.h20.iter().filter(|(_, m)| **m & 24 != 0)
+                    .map(|(k, m)| [k.to_vec(), vec![m & 24]].concat()).collect()),
+                ("f32.bin", expected.h32.iter().filter(|(_, m)| **m & 1 != 0).map(|(k, _)| k.to_vec()).collect()),
+                ("r32.bin", expected.h32.iter().filter(|(_, m)| **m & 6 != 0)
+                    .map(|(k, m)| [k.to_vec(), vec![m & 6]].concat()).collect()),
+            ] {
+                records.sort();
+                assert_eq!(fs::read(temp.0.join("out/state").join(name))?, records.concat(), "{}", name);
+            }
+            Ok(())
+        }
+
+        fn fixture_key(number: u8) -> Result<PublicKey, String> {
+            let mut secret = [0; 32];
+            secret[31] = number;
+            let secret = secp256k1::SecretKey::from_slice(&secret).map_err(|e| e.to_string())?;
+            Ok(PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret))
+        }
+
+        fn rich_fixture_chain() -> Result<Vec<Vec<u8>>, String> {
+            let mut spends = Vec::new();
+            let mut funding = Vec::new();
+            for case in hand_cases()? {
+                // Fund in other blocks to cover every reveal/cross form while keeping each row's test independent.
+                for (hash, mask) in case.expected.h20 {
+                    if mask & 8 != 0 { funding.push([vec![0xa9, 20], hash.to_vec(), vec![0x87]].concat()); }
+                }
+                for (hash, mask) in case.expected.h32 {
+                    if mask & 2 != 0 { funding.push([vec![0, 32], hash.to_vec()].concat()); }
+                }
+                // The standard key spend's pubkey hash appears in an earlier funding transaction.
+                for x in case.expected.x.keys() {
+                    funding.push(pkh(hash160(&compressed(x))));
+                    funding.push(wpkh(hash160(&compressed(x))));
+                    funding.push(p2sh(&wpkh(hash160(&compressed(x)))));
+                }
+                spends.push(case.tx);
+            }
+            // Fund all six SEC encodings and their wrapped forms for an already-published key.
+            let mut key = fixture_key(100)?.serialize();
+            for prefix in [2, 3] {
+                key[0] = prefix;
+                let uncompressed = PublicKey::from_slice(&key).map_err(|e| e.to_string())?.serialize_uncompressed();
+                let mut hybrid = uncompressed;
+                hybrid[0] = prefix + 4;
+                for encoding in [&key[..], &uncompressed[..], &hybrid[..]] {
+                    let hash = hash160(encoding);
+                    funding.push(pkh(hash));
+                    funding.push(p2sh(&wpkh(hash)));
+                }
+            }
+            funding.sort();
+            funding.dedup();
+            spends.insert(0, TestTx { coinbase: false, script_sig: vec![], outputs: funding, witness: vec![], lock_time: 0 });
+            // Use a separate transaction per key; multiple funding forms for the same key specifically test cross_type_reuse.
+            for number in 100..108 {
+                let point = fixture_key(number)?;
+                let key = point.serialize().to_vec();
+                let uncompressed = point.serialize_uncompressed().to_vec();
+                let mut hybrid = uncompressed.clone();
+                hybrid[0] = 6 + (hybrid[64] & 1);
+                spends.push(TestTx { coinbase: false, script_sig: vec![], witness: vec![], lock_time: 0, outputs: vec![
+                    [push(&key), vec![0xac]].concat(), pkh(hash160(&key)), wpkh(hash160(&key)),
+                    p2sh(&wpkh(hash160(&key))), pkh(hash160(&uncompressed)), pkh(hash160(&hybrid)),
+                ] });
+            }
+            // Annex, future leaf versions, and invalid controls each use separate signing and internal keys.
+            for (number, version, paths, annex, bad_control) in [
+                (120, 0xc0, 0, true, false), (123, 0xc0, 2, true, false),
+                (126, 0xc2, 0, false, false), (129, 0xc0, 0, false, true),
+            ] {
+                let key = fixture_key(number)?.serialize();
+                let internal = fixture_key(number + 1)?.serialize();
+                let uncompressed = fixture_key(number + 2)?.serialize_uncompressed();
+                let mut hybrid = uncompressed;
+                hybrid[0] = 6 + (hybrid[64] & 1);
+                let script = [push(&key[1..]), vec![0xad], push(&key), push(&hybrid),
+                    push(&[vec![2], vec![0xff; 32]].concat())].concat();
+                let mut control = [vec![version], if bad_control { vec![0xff; 32] } else { internal[1..].to_vec() }].concat();
+                for index in 0..paths { control.extend_from_slice(&[number + index; 32]); }
+                let mut witness = vec![vec![number; 64], script.clone(), control];
+                if annex { witness.push(vec![0x50, number]); }
+                spends.push(TestTx { coinbase: false, script_sig: vec![], witness, lock_time: 0,
+                    outputs: vec![p2sh(&script), p2wsh(&script), p2sh(&p2wsh(&script))] });
+            }
+            let p2pk = [push(&fixture_key(140)?.serialize()), vec![0xac]].concat();
+            spends.push(TestTx { coinbase: false, script_sig: push(&[0x45; 64]), witness: vec![], outputs: vec![p2pk], lock_time: 0 });
+            let redeem = [push(&fixture_key(141)?.serialize()), vec![0xac]].concat();
+            spends.push(TestTx { coinbase: false, script_sig: push(&redeem), witness: vec![],
+                outputs: vec![p2sh(&redeem), p2wsh(&redeem)], lock_time: 0 });
+            spends.push(TestTx { coinbase: false, script_sig: vec![], witness: vec![vec![0x46; 64], vec![]],
+                outputs: vec![p2wsh(&[])], lock_time: 0 });
+            let count = spends.len().max(40);
+            let mut spends = spends.into_iter();
+            let mut chain = Vec::new();
+            let mut prev = [0; 32];
+            for height in 0..count {
+                let txs = committed_transactions(spends.next().into_iter().collect(), height as u32);
+                let mut block = block_bytes(&txs, true);
+                block[4..36].copy_from_slice(&prev);
+                block[68..72].copy_from_slice(&(height as u32).to_le_bytes());
+                prev = double_sha256(&block[..80]);
+                chain.push(block);
+            }
+            Ok(chain)
+        }
+
+        #[test]
+        #[ignore]
+        fn write_scan_fixture() -> TestResult {
+            let dir = PathBuf::from(env::var("BTC_INDEXER_FIXTURE_DIR")?);
+            write_chain(&dir, &rich_fixture_chain()?)?;
+            Ok(())
+        }
+
+        #[test]
+        fn chain_list_strict_format() -> TestResult {
+            let a = "01".repeat(32);
+            let b = "ab".repeat(32);
+            let valid = format!("0 {}\n1 {}\n", a, b);
+            assert_eq!(parse_chain_list(valid.as_bytes())?.len(), 2);
+            let cases = vec![
+                ("".to_string(), 1), (format!("0 {}", a), 1), (format!("0 {}\n1 {}", a, b), 2),
+                (format!("0 {}\r\n", a), 1), (format!("00 {}\n", a), 1),
+                (format!("1 {}\n", a), 1), (format!("0 {}\n2 {}\n", a, b), 2),
+                (format!("0 {}\n1 {}\n", a, a), 2), (format!("0 {}\n", b.to_uppercase()), 1),
+                (format!("0 {} \n", a), 1), (format!("0  {}\n", a), 1),
+                (format!("0 {}\n\n", a), 2), ("0 00\n".to_string(), 1),
+                (format!("0 {}g\n", &a[..63]), 1), (format!("0 {}\n", "\u{e9}".repeat(32)), 1),
+                (format!("0 {}\n1\t{}\n", a, b), 2), (format!("+0 {}\n", a), 1),
+            ];
+            for (input, line) in cases {
+                let err = parse_chain_list(input.as_bytes()).err().ok_or("invalid chain list accepted")?;
+                assert!(err.contains(&format!("line {}:", line)), "{}", err);
+            }
+            Ok(())
+        }
+
+        fn extraction_error(block: &[u8], expected: &[u8; 32], prev: &[u8; 32], message: &str) -> TestResult {
+            let err = extract_block(block, 0, expected, prev).err().ok_or("invalid block accepted")?;
+            assert!(err.contains(message) && err.contains("height 0") && err.contains(&display_hash(expected))
+                && err.contains("byte offset"), "{}", err);
+            Ok(())
+        }
+
+        #[test]
+        fn extractor_validation_negatives() -> TestResult {
+            let valid = block_bytes(&fixture(), true);
+            let hash = double_sha256(&valid[..80]);
+            assert_eq!(extract_block(&valid, 0, &hash, &[0; 32])?.transactions, 3);
+            extraction_error(&valid[..79], &hash, &[0; 32], "short header")?;
+            extraction_error(&valid, &[9; 32], &[0; 32], "header hash mismatch")?;
+            extraction_error(&valid, &hash, &[1; 32], "previous block hash mismatch")?;
+            let mut block = valid.clone(); block.push(0);
+            extraction_error(&block, &hash, &[0; 32], "trailing bytes")?;
+            let mut block = valid[..90].to_vec();
+            extraction_error(&block, &hash, &[0; 32], "does not parse")?;
+            block = valid[..80].to_vec();
+            extraction_error(&block, &hash, &[0; 32], "transaction count")?;
+            block.push(0);
+            extraction_error(&block, &hash, &[0; 32], "transaction count")?;
+            block = valid.clone(); block[36] ^= 1;
+            extraction_error(&block, &double_sha256(&block[..80]), &[0; 32], "merkle root mismatch")?;
+            let mut txs = fixture();
+            let last = txs.last().ok_or("missing fixture tx")?;
+            txs.push(TestTx { coinbase: last.coinbase, script_sig: last.script_sig.clone(),
+                outputs: last.outputs.clone(), witness: last.witness.clone(), lock_time: last.lock_time });
+            block = block_bytes(&txs, true);
+            extraction_error(&block, &double_sha256(&block[..80]), &[0; 32], "mutated merkle tree")?;
+            let mut txs = fixture(); txs[0].outputs[2][6] ^= 1;
+            block = block_bytes(&txs, true);
+            extraction_error(&block, &double_sha256(&block[..80]), &[0; 32], "witness commitment mismatch")?;
+            let mut txs = fixture(); txs[0].witness.clear();
+            block = block_bytes(&txs, true);
+            extraction_error(&block, &double_sha256(&block[..80]), &[0; 32], "reserved value")?;
+            let mut txs = fixture(); txs[0].outputs.clear();
+            block = block_bytes(&txs, true);
+            extraction_error(&block, &double_sha256(&block[..80]), &[0; 32], "missing witness commitment")?;
+            Ok(())
+        }
+
+        #[test]
+        fn digest_known_answer() -> TestResult {
+            let block = std::array::from_fn(|i| i as u8);
+            let hashes = DIGEST_FILES.map(|name| sha256(name.as_bytes()));
+            assert_eq!(1 + RULES_VERSION.len() + 8 + 32 + 8 * 32, 322);
+            assert_eq!(hex::encode(hashes[0]), "ec8bb72991f2b1c7899099920b58572b5ad622a3ab0ffdd0dcf900997d011530");
+            assert_eq!(hex::encode(state_digest(RULES_VERSION, 975019, &block, &hashes)?),
+                "c226df66cefb911b70f1859d0e04b87d7b6efa9572eb631f992f066b5e2199fa");
+            Ok(())
+        }
+
+        #[test]
+        fn real_scan_state_checkpoint_and_fail_closed_cases() -> TestResult {
+            let temp = TempDir::new()?;
+            let chain = synthetic_chain(40)?;
+            write_chain(&temp.0, &chain)?;
+            let mut first = vec![0x77, 0x88, 0x99];
+            let mut second = Vec::new();
+            for (h, b) in chain.iter().enumerate().rev() {
+                if h % 2 == 0 { first.extend(record(b)); } else { second.extend(record(b)); }
+            }
+            let mut stale = chain[0].clone(); stale[76] ^= 1;
+            first.extend(record(&stale));
+            first.extend([0; 64]);
+            second.extend([0xf9, 0xbe, 0xb4, 0xd9, 0xff, 0xff, 0, 0, 1, 2]);
+            fs::write(temp.0.join("blocks/blk00000.dat"), &first)?;
+            fs::write(temp.0.join("blocks/blk00001.dat"), &second)?;
+            assert_eq!(scan(&temp.0, "out")?, 1);
+            let out = temp.0.join("out");
+            let stats: serde_json::Value = serde_json::from_slice(&fs::read(out.join("stats.json"))?)?;
+            let checkpoint: serde_json::Value = serde_json::from_slice(&fs::read(out.join("checkpoint.json"))?)?;
+            assert_eq!(stats["scan_height"], 39);
+            assert_eq!(stats["scan_block_hash"], header_hash(&chain[39]));
+            assert_eq!(checkpoint["format"], "btc-indexer-checkpoint/1");
+            assert_eq!(checkpoint["rules_version"], RULES_VERSION);
+            assert_eq!(checkpoint["height"], 39);
+            assert_eq!(checkpoint["block_hash"], stats["scan_block_hash"]);
+            assert_eq!(fs::read(out.join("last_indexed_height"))?, b"39\n");
+            assert_ne!(fs::read(out.join("stats.json"))?.last(), Some(&b'\n'));
+            assert_ne!(fs::read(out.join("checkpoint.json"))?.last(), Some(&b'\n'));
+            assert!(!out.join("shards").exists());
+            let mut expected_x = FxHashMap::default();
+            let mut expected_h20 = FxHashMap::default();
+            let mut expected_h32 = FxHashMap::default();
+            for (h, b) in chain.iter().enumerate() {
+                let prev = if h == 0 { [0; 32] } else { double_sha256(&chain[h - 1][..80]) };
+                let e = extract_block(b, h as u64, &double_sha256(&b[..80]), &prev)?;
+                for (k, m) in e.x { *expected_x.entry(k).or_insert(0u8) |= m; }
+                for (k, m) in e.h20 { *expected_h20.entry(k).or_insert(0u8) |= m; }
+                for (k, m) in e.h32 { *expected_h32.entry(k).or_insert(0u8) |= m; }
+            }
+            assert!(expected_x.contains_key(&[0xff; 32]));
+            for (name, key_width, width, expected) in [
+                ("state/x.bin", 32, 33, expected_x.iter().map(|(k,m)| [k.to_vec(), vec![*m]].concat()).collect::<Vec<_>>()),
+                ("state/f20.bin", 20, 21, expected_h20.iter().filter(|(_,m)| **m & 7 != 0).map(|(k,m)| [k.to_vec(), vec![m & 7]].concat()).collect()),
+                ("state/r20.bin", 20, 21, expected_h20.iter().filter(|(_,m)| **m & 24 != 0).map(|(k,m)| [k.to_vec(), vec![m & 24]].concat()).collect()),
+                ("state/f32.bin", 32, 32, expected_h32.iter().filter(|(_,m)| **m & 1 != 0).map(|(k,_)| k.to_vec()).collect()),
+                ("state/r32.bin", 32, 33, expected_h32.iter().filter(|(_,m)| **m & 6 != 0).map(|(k,m)| [k.to_vec(), vec![m & 6]].concat()).collect()),
+            ] {
+                let bytes = fs::read(out.join(name))?;
+                assert_eq!(bytes.len() % width, 0);
+                let records: Vec<_> = bytes.chunks_exact(width).collect();
+                assert!(records.windows(2).all(|w| w[0][..key_width] < w[1][..key_width]));
+                let mut expected = expected; expected.sort();
+                assert_eq!(bytes, expected.concat(), "{}", name);
+            }
+            assert_eq!(fs::metadata(out.join("state/x.bin"))?.len() / 33,
+                stats["unique_published_x_coords"].as_u64().ok_or("missing x count")?);
+            for name in ["pubkey_hash_index.bin", "script_hash_index_20.bin", "script_hash_index_32.bin",
+                "cross_format_diff_20.bin", "cross_format_diff_32.bin"] {
+                assert!(fs::metadata(out.join(name))?.len() > 0, "empty fixture table {}", name);
+            }
+            let entries = checkpoint["files"].as_object().ok_or("missing checkpoint files")?;
+            assert_eq!(entries.len(), 12);
+            for (name, meta) in entries {
+                let bytes = fs::read(out.join(name))?;
+                assert_eq!(meta["bytes"], bytes.len() as u64);
+                assert_eq!(meta["sha256"], hex::encode(sha256(&bytes)));
+                if let Some(records) = meta.get("records") {
+                    let width = if name == "state/x.bin" || name == "state/r32.bin" { 33 }
+                        else if name == "state/f20.bin" || name == "state/r20.bin" { 21 }
+                        else if name.ends_with("32.bin") { 32 } else { 20 };
+                    assert_eq!(records.as_u64(), Some(bytes.len() as u64 / width));
+                } else { assert!(name == "stats.json" || name == "last_indexed_height"); }
+            }
+            let mut hashes = [[0; 32]; 8];
+            for (i, name) in DIGEST_FILES.iter().enumerate() { hashes[i] = sha256(&fs::read(out.join(name))?); }
+            let mut display = double_sha256(&chain[39][..80]); display.reverse();
+            assert_eq!(checkpoint["state_digest"], hex::encode(state_digest(RULES_VERSION, 39, &display, &hashes)?));
+            assert!(scan(&temp.0, "out").err().is_some_and(|e| e.contains("empty")));
+            fs::write(temp.0.join("blocks/xor.dat"), [0, 1])?;
+            assert!(scan(&temp.0, "xor").err().is_some_and(|e| e.contains("xor.dat")));
+            fs::write(temp.0.join("blocks/xor.dat"), [0; 8])?;
+            fs::write(temp.0.join("blocks/blk00000.dat"), record(&chain[0]))?;
+            fs::write(temp.0.join("blocks/blk00001.dat"), record(&chain[0]))?;
+            assert!(scan(&temp.0, "duplicate").err().is_some_and(|e| e.contains("duplicate block")));
+            fs::write(temp.0.join("blocks/blk00001.dat"), [])?;
+            assert!(scan(&temp.0, "missing").err().is_some_and(|e| e.contains("39 listed blocks missing")));
+            Ok(())
+        }
+
+        fn fake_export(mode: &'static str, height: u64) -> TestResult {
+            let temp = TempDir::new()?;
+            fs::write(temp.0.join("cookie"), "__cookie__:secret\n")?;
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let url = format!("http://{}/", listener.local_addr()?);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let thread = std::thread::spawn(move || -> Result<Vec<usize>, String> {
+                let mut batch_sizes = Vec::new();
+                loop {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            if worker_stop.load(Ordering::Relaxed) { return Ok(batch_sizes); }
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        },
+                        Err(e) => return Err(e.to_string()),
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+                    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+                    let mut header = String::new();
+                    let mut length = None;
+                    let mut authorized = false;
+                    loop {
+                        header.clear();
+                        if reader.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+                            return Err("fake RPC premature EOF".to_string());
+                        }
+                        if header == "\r\n" { break; }
+                        if header == "Authorization: Basic X19jb29raWVfXzpzZWNyZXQ=\r\n" { authorized = true; }
+                        if let Some(n) = header.strip_prefix("Content-Length: ") {
+                            length = Some(n.trim().parse::<usize>().map_err(|e| e.to_string())?);
+                        }
+                    }
+                    if !authorized { return Err("fake RPC authorization mismatch".to_string()); }
+                    let mut body = vec![0; length.ok_or("fake RPC missing Content-Length")?];
+                    reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+                    let request: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+                    let response = if let Some(calls) = request.as_array() {
+                        batch_sizes.push(calls.len());
+                        let mut results: Vec<_> = calls.iter().rev().map(|call| {
+                            let id = call["id"].as_u64().unwrap_or(u64::MAX);
+                            let mut hash = hex::encode(sha256(&id.to_be_bytes()));
+                            if mode == "uppercase" { hash = hash.to_uppercase(); }
+                            serde_json::json!({"id":id,"result":hash,"error":null})
+                        }).collect();
+                        if mode == "duplicate-id" && !results.is_empty() { results.push(results[0].clone()); }
+                        if mode == "missing-id" { results.pop(); }
+                        serde_json::Value::Array(results)
+                    } else if request["method"] == "getblockchaininfo" {
+                        serde_json::json!({"id":0,"error":null,"result":{
+                            "initialblockdownload": mode == "ibd", "blocks": if mode == "depth" { height + 99 } else { height + 100 },
+                            "headers": if mode == "depth" { height + 99 } else { height + 100 }}})
+                    } else {
+                        let mut hash = sha256(&height.to_be_bytes());
+                        if mode == "reorg" { hash[0] ^= 1; }
+                        serde_json::json!({"id":0,"result":hex::encode(hash),"error":null})
+                    };
+                    let bytes = if mode == "json" { b"{broken".to_vec() }
+                        else if mode == "rpc-error" { br#"{"id":0,"error":{"code":-1},"result":null}"#.to_vec() }
+                        else { serde_json::to_vec(&response).map_err(|e| e.to_string())? };
+                    if mode == "no-length" {
+                        write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+                    } else if mode == "status" {
+                        write!(stream, "HTTP/1.1 500 Bad\r\nContent-Length: 0\r\n\r\n").map_err(|e| e.to_string())?;
+                    } else {
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).map_err(|e| e.to_string())?;
+                        stream.write_all(&bytes).map_err(|e| e.to_string())?;
+                    }
+                }
+            });
+            let out = temp.0.join("list.txt");
+            let result = export_chain_list(&url, &temp.0.join("cookie"), height, &out);
+            stop.store(true, Ordering::Relaxed);
+            let batches = thread.join().map_err(|_| "fake RPC thread panicked")??;
+            if mode == "success" {
+                result?;
+                let chain = parse_chain_list(&fs::read(&out)?)?;
+                assert_eq!(chain.len() as u64, height + 1);
+                assert_eq!(batches, vec![1000, 2]);
+                assert!(export_chain_list(&url, &temp.0.join("cookie"), height, &out).is_err());
+            } else {
+                assert!(result.is_err(), "fake export mode {} succeeded", mode);
+                assert!(!out.exists());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn export_rpc_batch_auth_and_rejections() -> TestResult {
+            for (bytes, expected) in [(b"".as_slice(), ""), (b"f", "Zg=="), (b"fo", "Zm8="),
+                (b"foo", "Zm9v"), (b"foob", "Zm9vYg==")] {
+                assert_eq!(base64(bytes), expected);
+            }
+            for mode in ["success", "ibd", "depth", "reorg", "json", "rpc-error",
+                "no-length", "status", "uppercase", "duplicate-id", "missing-id"] {
+                fake_export(mode, 1001)?;
+            }
+            let temp = TempDir::new()?;
+            let cookie = temp.0.join("cookie");
+            fs::write(&cookie, "__cookie__:url-test\n")?;
+            for (index, (url, expected)) in [
+                ("https://localhost:8332/", "RPC URL must be http://<host>:<port>/"),
+                ("http://localhost:8332/x", "RPC URL must be http://<host>:<port>/"),
+                ("http://localhost/", "RPC URL requires a port"),
+                ("http://localhost:8332", "RPC URL must be http://<host>:<port>/"),
+                ("http://a:8332/x/", "RPC URL must be http://<host>:<port>/"),
+                ("http://u@a:8332/", "RPC URL must be http://<host>:<port>/"),
+            ].into_iter().enumerate() {
+                let error = export_chain_list(url, &cookie, 0, &temp.0.join(format!("url-{}.txt", index)))
+                    .err().ok_or("invalid RPC URL accepted")?;
+                assert_eq!(error, expected, "{}", url);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn missing_directory_levels_are_ordered_and_exclude_existing_ancestors() -> TestResult {
+            let temp = TempDir::new()?;
+            let path = temp.0.join("a/b/c");
+            assert_eq!(missing_directory_levels(&path)?,
+                vec![temp.0.join("a"), temp.0.join("a/b"), path.clone()]);
+            fs::create_dir(temp.0.join("a"))?;
+            assert_eq!(missing_directory_levels(&path)?, vec![temp.0.join("a/b"), path]);
+            assert!(missing_directory_levels(&temp.0)?.is_empty());
+
+            let relative_root = PathBuf::from(temp.0.file_name().ok_or("test directory name")?).with_extension("missing");
+            assert!(matches!(fs::symlink_metadata(&relative_root),
+                Err(e) if e.kind() == io::ErrorKind::NotFound));
+            let relative = relative_root.join("a/b/c");
+            assert_eq!(missing_directory_levels(&relative)?,
+                vec![relative_root.clone(), relative_root.join("a"), relative_root.join("a/b"), relative]);
+            Ok(())
+        }
+
+        #[test]
+        fn missing_directory_levels_rejects_paths_through_regular_files() -> TestResult {
+            let temp = TempDir::new()?;
+            fs::write(temp.0.join("f"), b"")?;
+            let path = temp.0.join("f/x");
+            let error = missing_directory_levels(&path).err().ok_or("path through regular file accepted")?;
+            assert!(error.starts_with(&format!("{}: metadata: ", path.display())), "{}", error);
+            Ok(())
+        }
+
+        #[test]
+        fn scan_rejects_empty_output_directory_without_creating_files() -> TestResult {
+            let temp = TempDir::new()?;
+            let error = scan_blocks_dir(temp.0.join("blocks").to_str().ok_or("test blocks path")?, "",
+                temp.0.join("chain-list.txt").to_str().ok_or("test list path")?)
+                .err().ok_or("empty output directory accepted")?;
+            assert_eq!(error, "output directory path must not be empty");
+            assert_eq!(fs::read_dir(&temp.0)?.count(), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn failed_checkpoint_withdrawal_removes_file_and_preserves_original_error() -> TestResult {
+            let temp = TempDir::new()?;
+            let path = temp.0.join("checkpoint.json");
+            fs::write(&path, b"{}")?;
+            let error = withdraw_failed_checkpoint(&path, "original publication error".to_string());
+            assert!(error.starts_with("original publication error; "), "{}", error);
+            assert!(error.contains(&path.display().to_string()) && error.contains(": removed"), "{}", error);
+            assert!(matches!(fs::symlink_metadata(&path), Err(e) if e.kind() == io::ErrorKind::NotFound));
+            Ok(())
+        }
+
+        #[test]
+        fn failed_checkpoint_withdrawal_preserves_error_when_file_is_absent() -> TestResult {
+            let temp = TempDir::new()?;
+            let error = withdraw_failed_checkpoint(&temp.0.join("checkpoint.json"), "original publication error".to_string());
+            assert_eq!(error, "original publication error");
+            Ok(())
+        }
+
+        #[test]
+        fn failed_checkpoint_withdrawal_warns_when_path_cannot_be_removed() -> TestResult {
+            let temp = TempDir::new()?;
+            let path = temp.0.join("checkpoint.json");
+            fs::create_dir(&path)?;
+            let error = withdraw_failed_checkpoint(&path, "original publication error".to_string());
+            assert!(error.starts_with("original publication error; "), "{}", error);
+            assert!(error.contains(&path.display().to_string())
+                && error.contains("remains in the output directory and must not be used: remove: "), "{}", error);
+            assert!(path.is_dir());
+            Ok(())
+        }
+
+        #[test]
+        fn writer_ordering_and_missing_shard_errors() -> TestResult {
+            let temp = TempDir::new()?;
+            let mut writer = ScanWriter::new(temp.0.join("state.bin"))?;
+            writer.record(&[2; 32], &[1])?;
+            assert!(writer.record(&[2; 32], &[2]).is_err());
+            assert!(writer.record(&[1; 32], &[1]).is_err());
+            writer.finish(Some(33))?;
+            assert!(read_scan_shard(&temp.0.join("missing.bin"), 33).is_err());
+            fs::write(temp.0.join("short.bin"), [0; 32])?;
+            assert!(read_scan_shard(&temp.0.join("short.bin"), 33).is_err());
+            Ok(())
+        }
+    }
+
 }
 
 #[cfg(test)]

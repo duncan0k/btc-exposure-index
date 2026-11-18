@@ -1,11 +1,12 @@
 # Results at block 975,019
 
-Output of the 975019 scan, the UTXO census and three cross-checks, kept byte for byte as written. `SHA256SUMS`
-covers the other files in this directory. Amounts are in satoshis.
+Output of the two scans to block 975,019, the UTXO census and three cross-checks, kept byte for byte as written,
+and the SHA256 of the chain list that the chain-list scan read. `SHA256SUMS` covers the other files in
+this directory. Amounts are in satoshis.
 
 | File | Written by |
 | --- | --- |
-| `btc-indexer-stats.json` | `btc-indexer --scan-blocks`: the `stats.json` of the full scan to block 975,019, rebuilt on 2026-11-08 |
+| `btc-indexer-stats.json` | `btc-indexer --scan-blocks` of internal revision `fbc9a9d`, an earlier scanner than the one in this repository (see Code versions below): the `stats.json` of the full scan to block 975,019, rebuilt on 2026-11-08 |
 | `verify-against-original.log` | The check of that scan's five tables and `last_indexed_height` against the six checksums in section 5.5 of `docs/extraction-rules.md`, which come from the first build; `rc=0` is its exit status |
 | `utxo-census-stats.json` | `tools/utxo-census`: the `stats.json` of a run over the UTXO set at block 975,019 (`dumptxoutset`) and the five tables of that scan |
 | `utxo-census-audit-manifest.json` | An audit extension of `tools/utxo-census`, which is not included in this repository, run once over the same `dumptxoutset` file and the same five tables: the manifest of that run, published unchanged |
@@ -13,10 +14,16 @@ covers the other files in this directory. Amounts are in satoshis.
 | `utxo-census-audit-structural-keys.json` | The same run: P2PK, P2TR and bare-multisig outputs by key validity, including keys in hybrid encoding (`structural-keys.json` in the manifest) |
 | `witness-program-histogram.json` | `tools/validation/witness-histogram.py`: witness programs in the same UTXO set by version and program length, the class totals it was checked against, and the P2PK outputs whose key has the hybrid prefix 06 or 07 |
 | `esplora-sample-summary.json` | The audit extension drew the sample; a script that is not in this repository checked it against the public Esplora API at `mempool.space` and wrote this file. Aggregates only: no addresses, scripts or transaction ids |
+| `chain-list-scan-stats.json` | `btc-indexer --scan-blocks` of this repository, run over the chain list on 2026-11-16 (the chain-list scan): its `stats.json` |
+| `chain-list-scan-checkpoint.json` | The chain-list scan: its `checkpoint.json` (section 5.4 of `docs/extraction-rules.md`) |
+| `verify-chain-list-scan.log` | The check of the chain-list scan's five tables and `last_indexed_height` against the six checksums in section 5.5 of `docs/extraction-rules.md`: the six lines that `sha256sum -c` printed |
+| `chain-975019.txt.sha256` | The SHA256 of the chain list that the chain-list scan read, as `sha256sum` prints it, under the file name of step 1 of the top-level README; the list itself, 975,020 lines and 70,090,330 bytes, is not included |
 
 Removing the `census` object from `btc-indexer-stats.json` and serializing the rest as in step 4 of the
 top-level README gives the `stats.json` of the fixed 975019 archive, sha256
-`2757785e8c344efc49e6ea4e632063eda0c0498031e6d8896e5cf21cf792cd3c`.
+`2757785e8c344efc49e6ea4e632063eda0c0498031e6d8896e5cf21cf792cd3c`. `chain-list-scan-stats.json` gives the same
+hash once `scan_height` and `scan_block_hash` are removed as well, and its `census` object equals that of
+`btc-indexer-stats.json`.
 
 ## Notes on the files
 
@@ -55,22 +62,25 @@ top-level README gives the `stats.json` of the fixed 975019 archive, sha256
 
 ## Code versions
 
-None of these files was regenerated with the code in this repository, and the code in this repository has not
-itself been run over the chain end to end.
+The scanner in this repository wrote `chain-list-scan-stats.json` and `chain-list-scan-checkpoint.json`;
+`verify-chain-list-scan.log` and `chain-975019.txt.sha256` come from the same run. The other files come from
+earlier code, as the list below says; none of them was regenerated with the code in this repository.
 
 - `btc-indexer-stats.json` names no tool version. It comes from the 2026-11-08 build, run with no shard files to
   resume from and with the scanner of internal revision `fbc9a9d`, the first revision with the census counters;
   the commit that recorded the file has the same scanner source. `verify-against-original.log` checks that
-  build's tables against the first build, whose revision was not recorded. On the scan path,
-  `btc-indexer/src/main.rs` here differs from `fbc9a9d` only at lines 471-473, 486, 495 and 508, where
-  `capped_capacity` caps three preallocations at the remaining input, and at line 2262, the heading `Cross-type
-  reuse stats:`; neither changes what is parsed or written. Its other differences are in the per-block path, the
-  lookup API and HTTP server, the error handling of `--apply-block-hex` and `--compact` in `main`, and tests.
+  build's tables against the first build, whose revision was not recorded. On the scan path, the
+  `btc-indexer/src/main.rs` of the first commit of this repository (tag `original-scanner`) differs from `fbc9a9d` only at
+  lines 471-473, 486, 495 and 508, where `capped_capacity` caps three preallocations at the remaining input, and
+  at line 2262, the heading `Cross-type reuse stats:`; neither changes what is parsed or written. Its other
+  differences are in the per-block path, the lookup API and HTTP server, the error handling of
+  `--apply-block-hex` and `--compact` in `main`, and tests. The scanner in this repository replaces that scan
+  path with the chain-list scan of section 2.1 of `docs/extraction-rules.md`.
 - `utxo-census-stats.json` has `tool_version` `ba2bf8c+iter3-20261109T123057Z`: `ba2bf8c` is an internal
   commit, `+iter3` marks changes on top of it that were not yet committed, and the rest is the start of the
   run, 2026-11-09 12:30:57 UTC. Against `ba2bf8c`, these files differ here: `btc-indexer/src/main.rs`, and
   `codec.rs`, `curve.rs`, `details.rs`, `lib.rs`, `main.rs` and `tests.rs` in `tools/utxo-census/src/`. The
-  changes were committed together with the results; against that commit, only `btc-indexer/src/main.rs` and
+  changes were committed together with the results; against that commit, only files under `btc-indexer/` and
   `tools/utxo-census/src/tests.rs` differ, and the census tool does not use `btc-indexer`.
 - The three `utxo-census-audit-*` files come from an audit extension of `utxo-census` that is not included in
   this repository. The same run also wrote the census `stats.json`, which is not in this repository; it was
