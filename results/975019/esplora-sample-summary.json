@@ -1,0 +1,103 @@
+{
+ "description": "Aggregate results of a sample of unexposed outputs in the UTXO set at block height 975019, each checked against a third-party public Esplora API. No addresses, scripts, outpoints or transaction ids are included.",
+ "snapshot_height": 975019,
+ "snapshot_block_hash": "0000000000000000000158c9898f947463d71d98c97f1dad1639e25114a1dae6",
+ "sample": {
+  "drawn_by": "An audit extension of utxo-census, in the same run that wrote the utxo-census-audit files. The extension and the per-type lists of unexposed output scripts it wrote are not in this repository.",
+  "unexposed": "The output script is not listed as revealed at the snapshot height by the exposure tables of the 975019 scan.",
+  "unit": "Output (UTXO), not output script: each type's sample is a simple random sample of that type's unexposed outputs.",
+  "method": "Per output type, a uniform reservoir of 2000 UTXOs over the snapshot (Algorithm R driven by splitmix64), from which 250 UTXOs with an unexposed output script were selected.",
+  "seed": 975019,
+  "per_type_size": {
+   "p2pkh": 250,
+   "p2wpkh": 250,
+   "p2sh": 250,
+   "p2wsh": 250
+  },
+  "total_size": 1000
+ },
+ "rule": "A sampled output counts as a hit when a transaction confirmed at height 975019 or lower has an input whose previous output carries the same scriptPubKey as the sampled output.",
+ "not_counted": "Outputs whose scriptPubKey was spent only at heights above 975019 are not hits: at the snapshot height that script had not yet appeared in a spending input.",
+ "data_source": {
+  "kind": "Third-party public Esplora REST API, not the tables in this repository.",
+  "host": "mempool.space",
+  "endpoints": [
+   "/api/address/{address}",
+   "/api/address/{address}/txs/chain"
+  ],
+  "backup_host_configured_not_used": "blockstream.info",
+  "querying_script": "Not in this repository; neither is the script that wrote this summary."
+ },
+ "upper_bound_method": {
+  "per_type": "One-sided 95% Clopper-Pearson upper bound on the share of hits among the type's unexposed outputs; with no hits among n outputs it is 1 - 0.05^(1/n).",
+  "all_four_types": "One-sided 95% upper bound on the share of hits among all unexposed outputs of the four types, sum_i w_i p_i, where w_i is the share of type i in the counts listed under weights (its count divided by their sum): its maximum over the hit shares p_i with (1 - p_1)^250 (1 - p_2)^250 (1 - p_3)^250 (1 - p_4)^250 >= 0.05, the exact 95% confidence region when every type has no hits. With these weights the maximum has p_i = 0 for every type except the one with the largest weight, so the bound is w_max * (1 - 0.05^(1/250)).",
+  "weights": {
+   "p2pkh": 26367960,
+   "p2wpkh": 28091159,
+   "p2sh": 6339808,
+   "p2wsh": 2374753
+  },
+  "weight_unit": "Unexposed outputs of each type at the snapshot height, the unit the sample was drawn in.",
+  "weight_source": "utxo-census-stats.json: classes.<type>.utxo_count minus classes.<type>.exposed_utxo_count.",
+  "largest_weight_type": "p2wpkh"
+ },
+ "results": {
+  "p2pkh": {
+   "sampled": 250,
+   "spent_at_or_before_snapshot_height": 0,
+   "spent_only_after_snapshot_height": 0,
+   "not_spent_at_query_time": 250,
+   "upper_bound_95_one_sided": 0.011911
+  },
+  "p2wpkh": {
+   "sampled": 250,
+   "spent_at_or_before_snapshot_height": 0,
+   "spent_only_after_snapshot_height": 3,
+   "not_spent_at_query_time": 247,
+   "upper_bound_95_one_sided": 0.011911
+  },
+  "p2sh": {
+   "sampled": 250,
+   "spent_at_or_before_snapshot_height": 0,
+   "spent_only_after_snapshot_height": 2,
+   "not_spent_at_query_time": 248,
+   "upper_bound_95_one_sided": 0.011911
+  },
+  "p2wsh": {
+   "sampled": 250,
+   "spent_at_or_before_snapshot_height": 0,
+   "spent_only_after_snapshot_height": 3,
+   "not_spent_at_query_time": 247,
+   "upper_bound_95_one_sided": 0.011911
+  },
+  "all_four_types": {
+   "sampled": 1000,
+   "spent_at_or_before_snapshot_height": 0,
+   "spent_only_after_snapshot_height": 8,
+   "not_spent_at_query_time": 992,
+   "weighted_upper_bound_95_one_sided": 0.005297
+  }
+ },
+ "runs": [
+  {
+   "start_utc": "2026-11-12T04:02:56Z",
+   "end_utc": "2026-11-12T04:14:59Z",
+   "requests": 273,
+   "seconds_between_requests": 2,
+   "sample_rows": "1-267",
+   "rows_used": 266,
+   "http_429_responses": 3,
+   "ended": "Stopped after the third HTTP 429 response; row 267 was left unresolved and checked again in the second run."
+  },
+  {
+   "start_utc": "2026-11-12T04:20:40Z",
+   "end_utc": "2026-11-12T05:10:02Z",
+   "requests": 741,
+   "seconds_between_requests": 4,
+   "sample_rows": "267-1000",
+   "rows_used": 734,
+   "http_429_responses": 0,
+   "ended": "Complete."
+  }
+ ]
+}

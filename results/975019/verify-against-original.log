@@ -1,0 +1,7 @@
+pubkey_hash_index.bin: OK
+script_hash_index_20.bin: OK
+script_hash_index_32.bin: OK
+cross_format_diff_20.bin: OK
+cross_format_diff_32.bin: OK
+last_indexed_height: OK
+rc=0

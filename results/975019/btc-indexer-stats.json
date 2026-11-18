@@ -1,0 +1,41 @@
+{
+  "census": {
+    "funded_hash20_p2pkh": 608915048,
+    "funded_hash20_p2sh": 389693448,
+    "funded_hash20_p2wpkh": 437595697,
+    "funded_hash20_total": 1436010128,
+    "funded_hash32_p2wsh": 40521584,
+    "funded_hash32_p2wsh_note": null,
+    "keys_comp_and_uncomp_any_type": 5011,
+    "keys_comp_and_uncomp_p2pkh_only": 4570,
+    "keys_funded_in_2plus_script_types": 264361,
+    "keys_funded_in_3plus_script_types": 3942,
+    "keys_funded_in_any_form": 1279844406,
+    "keys_funded_p2pk": 217086,
+    "keys_funded_p2pk_and_p2pkh": 40385,
+    "keys_funded_p2pk_and_p2sh_p2wpkh": 16,
+    "keys_funded_p2pk_and_p2wpkh": 17,
+    "keys_funded_p2pkh": 591795195,
+    "keys_funded_p2pkh_and_p2sh_p2wpkh": 29167,
+    "keys_funded_p2pkh_and_p2wpkh": 189857,
+    "keys_funded_p2sh_p2wpkh": 270314282,
+    "keys_funded_p2wpkh": 417786147,
+    "keys_funded_p2wpkh_and_p2sh_p2wpkh": 12806,
+    "keys_hybrid_encoding_funded": 1,
+    "published_x_in_key_position": 1693875718,
+    "published_x_only_as_p2tr_output_key": 83039682,
+    "published_x_only_in_unrecognized_output_push": 15527,
+    "published_x_total": 1776932637
+  },
+  "cross_format_diff_20_entries": 1421774,
+  "cross_format_diff_32_entries": 185269,
+  "cross_type_reuse": {
+    "keys_in_both_compressed_and_uncompressed": 5011,
+    "keys_in_both_p2pk_and_p2pkh": 40385,
+    "keys_in_both_p2pkh_and_p2wpkh": 189857
+  },
+  "exposed_h160_entries": 1279711199,
+  "revealed_p2sh_20_entries": 384687335,
+  "revealed_p2wsh_32_entries": 39243253,
+  "unique_published_x_coords": 1776932637
+}
